@@ -102,12 +102,33 @@ data class GameSessionReport(
     val startCpuSnapshot: String?,
     val endCpuSnapshot: String?,
     val completedAtMs: Long,
-    val samplesJson: String? = null
+    val samplesJson: String? = null,
+    val startCharging: Boolean? = null,
+    val endCharging: Boolean? = null,
+    val startPluggedState: String? = null,
+    val endPluggedState: String? = null
 ) {
+    val batteryDeltaPercent: Int?
+        get() {
+            val start = startBatteryPercent ?: return null
+            val end = endBatteryPercent ?: return null
+            return end - start
+        }
+
+    val batteryChargingInvolved: Boolean
+        get() = startCharging == true || endCharging == true ||
+            startPluggedState?.let { it != "NONE" && it != "UNKNOWN" } == true ||
+            endPluggedState?.let { it != "NONE" && it != "UNKNOWN" } == true
+
     val batteryDrainPercent: Int?
         get() {
             val start = startBatteryPercent ?: return null
             val end = endBatteryPercent ?: return null
+
+            if (batteryChargingInvolved || end > start) {
+                return null
+            }
+
             return (start - end).coerceAtLeast(0)
         }
 }
@@ -560,6 +581,35 @@ private enum class ExportFormat {
     JSON
 }
 
+private data class BatteryState(
+    val tempC: Float?,
+    val percent: Int?,
+    val charging: Boolean,
+    val pluggedState: String
+)
+
+private data class SamplerReliability(
+    val expectedSamples: Int,
+    val capturedSamples: Int,
+    val missedSamples: Int,
+    val reliabilityPercent: Float,
+    val maxGapMs: Long
+)
+
+private data class RefreshAnalysis(
+    val minHz: Float?,
+    val maxHz: Float?,
+    val avgHz: Float?,
+    val dominantHz: Float?
+)
+
+private data class ThermalAnalysis(
+    val minTempC: Float?,
+    val maxTempC: Float?,
+    val deltaTempC: Float?,
+    val growthCPerMinute: Float?
+)
+
 private fun addManualGame(
     context: Context,
     packageManager: PackageManager,
@@ -639,6 +689,7 @@ private fun startGameSession(
     val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName) ?: return
 
     val rootMetricsEnabled = rootState.metricsEnabled
+    val batteryState = readBatteryState(context)
     val cpuSnapshot = if (rootMetricsEnabled) {
         readCpuFreqSnapshotWithRoot()
     } else {
@@ -652,8 +703,10 @@ private fun startGameSession(
         .putString("game_label", game.label)
         .putString("package_name", game.packageName)
         .putLong("start_elapsed_ms", SystemClock.elapsedRealtime())
-        .putFloat("start_battery_temp_c", readBatteryTemperatureC(context) ?: -1f)
-        .putInt("start_battery_percent", readBatteryPercent(context) ?: -1)
+        .putFloat("start_battery_temp_c", batteryState.tempC ?: -1f)
+        .putInt("start_battery_percent", batteryState.percent ?: -1)
+        .putBoolean("start_charging", batteryState.charging)
+        .putString("start_plugged_state", batteryState.pluggedState)
         .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
         .putBoolean("start_root_available", rootMetricsEnabled)
         .putString("start_cpu_snapshot", cpuSnapshot)
@@ -705,22 +758,27 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
     }
 
     val samplesJson = prefs.getString("active_samples_json", "[]") ?: "[]"
+    val endBatteryState = readBatteryState(context)
 
     val report = GameSessionReport(
         gameLabel = prefs.getString("game_label", "Unknown game") ?: "Unknown game",
         packageName = prefs.getString("package_name", "unknown.package") ?: "unknown.package",
         durationMs = durationMs,
         startBatteryTempC = prefs.getFloat("start_battery_temp_c", -1f).takeIf { it >= 0f },
-        endBatteryTempC = readBatteryTemperatureC(context),
+        endBatteryTempC = endBatteryState.tempC,
         startBatteryPercent = prefs.getInt("start_battery_percent", -1).takeIf { it >= 0 },
-        endBatteryPercent = readBatteryPercent(context),
+        endBatteryPercent = endBatteryState.percent,
         refreshRateHz = prefs.getFloat("refresh_rate_hz", -1f).takeIf { it >= 0f },
         startRootAvailable = prefs.getBoolean("start_root_available", false),
         endRootAvailable = rootMetricsEnabled,
         startCpuSnapshot = prefs.getString("start_cpu_snapshot", null),
         endCpuSnapshot = endCpuSnapshot,
         completedAtMs = System.currentTimeMillis(),
-        samplesJson = samplesJson
+        samplesJson = samplesJson,
+        startCharging = prefs.getBoolean("start_charging", false),
+        endCharging = endBatteryState.charging,
+        startPluggedState = prefs.getString("start_plugged_state", "UNKNOWN"),
+        endPluggedState = endBatteryState.pluggedState
     )
 
     prefs.edit()
@@ -738,6 +796,10 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         .putString("last_start_cpu_snapshot", report.startCpuSnapshot)
         .putString("last_end_cpu_snapshot", report.endCpuSnapshot)
         .putString("last_samples_json", report.samplesJson)
+        .putBoolean("last_start_charging", report.startCharging ?: false)
+        .putBoolean("last_end_charging", report.endCharging ?: false)
+        .putString("last_start_plugged_state", report.startPluggedState)
+        .putString("last_end_plugged_state", report.endPluggedState)
         .putLong("last_completed_at_ms", report.completedAtMs)
         .apply()
 
@@ -770,7 +832,11 @@ private fun loadLastReport(context: Context): GameSessionReport? {
         startCpuSnapshot = prefs.getString("last_start_cpu_snapshot", null),
         endCpuSnapshot = prefs.getString("last_end_cpu_snapshot", null),
         completedAtMs = prefs.getLong("last_completed_at_ms", 0L),
-        samplesJson = prefs.getString("last_samples_json", null)
+        samplesJson = prefs.getString("last_samples_json", null),
+        startCharging = prefs.getBoolean("last_start_charging", false),
+        endCharging = prefs.getBoolean("last_end_charging", false),
+        startPluggedState = prefs.getString("last_start_plugged_state", "UNKNOWN"),
+        endPluggedState = prefs.getString("last_end_plugged_state", "UNKNOWN")
     )
 }
 
@@ -805,6 +871,10 @@ private fun appendReportHistory(
                 .put("endRootAvailable", item.endRootAvailable ?: JSONObject.NULL)
                 .put("startCpuSnapshot", item.startCpuSnapshot ?: JSONObject.NULL)
                 .put("endCpuSnapshot", item.endCpuSnapshot ?: JSONObject.NULL)
+                .put("startCharging", item.startCharging ?: JSONObject.NULL)
+                .put("endCharging", item.endCharging ?: JSONObject.NULL)
+                .put("startPluggedState", item.startPluggedState ?: JSONObject.NULL)
+                .put("endPluggedState", item.endPluggedState ?: JSONObject.NULL)
                 .put("completedAtMs", item.completedAtMs)
 
             array.put(objectValue)
@@ -847,7 +917,11 @@ private fun loadReportHistory(context: Context): List<GameSessionReport> {
                         endRootAvailable = item.optNullableBoolean("endRootAvailable"),
                         startCpuSnapshot = item.optNullableString("startCpuSnapshot"),
                         endCpuSnapshot = item.optNullableString("endCpuSnapshot"),
-                        completedAtMs = completedAtMs
+                        completedAtMs = completedAtMs,
+                        startCharging = item.optNullableBoolean("startCharging"),
+                        endCharging = item.optNullableBoolean("endCharging"),
+                        startPluggedState = item.optNullableString("startPluggedState"),
+                        endPluggedState = item.optNullableString("endPluggedState")
                     )
                 )
             }
@@ -1000,30 +1074,57 @@ private fun JSONObject.optNullableString(name: String): String? {
     return optString(name).takeIf { it.isNotBlank() }
 }
 
-private fun readBatteryTemperatureC(context: Context): Float? {
+private fun readBatteryState(context: Context): BatteryState {
     val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        ?: return null
 
-    val rawTemp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
-    if (rawTemp == Int.MIN_VALUE) {
-        return null
+    if (intent == null) {
+        return BatteryState(
+            tempC = null,
+            percent = null,
+            charging = false,
+            pluggedState = "UNKNOWN"
+        )
     }
 
-    return rawTemp / 10f
-}
-
-private fun readBatteryPercent(context: Context): Int? {
-    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        ?: return null
+    val rawTemp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+    val tempC = if (rawTemp == Int.MIN_VALUE) null else rawTemp / 10f
 
     val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
     val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-
-    if (level < 0 || scale <= 0) {
-        return null
+    val percent = if (level >= 0 && scale > 0) {
+        ((level * 100f) / scale).roundToInt().coerceIn(0, 100)
+    } else {
+        null
     }
 
-    return ((level * 100f) / scale).roundToInt().coerceIn(0, 100)
+    val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+    val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+        status == BatteryManager.BATTERY_STATUS_FULL
+
+    val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+    val pluggedState = when {
+        plugged and BatteryManager.BATTERY_PLUGGED_AC != 0 -> "AC"
+        plugged and BatteryManager.BATTERY_PLUGGED_USB != 0 -> "USB"
+        plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS != 0 -> "WIRELESS"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            plugged and BatteryManager.BATTERY_PLUGGED_DOCK != 0 -> "DOCK"
+        else -> "NONE"
+    }
+
+    return BatteryState(
+        tempC = tempC,
+        percent = percent,
+        charging = charging || pluggedState != "NONE",
+        pluggedState = pluggedState
+    )
+}
+
+private fun readBatteryTemperatureC(context: Context): Float? {
+    return readBatteryState(context).tempC
+}
+
+private fun readBatteryPercent(context: Context): Int? {
+    return readBatteryState(context).percent
 }
 
 private fun readRefreshRateHz(context: Context): Float? {
@@ -1128,6 +1229,10 @@ private fun batteryCostPercentPerMinute(report: GameSessionReport): Float? {
 }
 
 private fun estimatedFullBatteryMinutes(report: GameSessionReport): Int? {
+    if (batteryCostUnavailableReason(report) != null) {
+        return null
+    }
+
     val rate = batteryCostPercentPerMinute(report) ?: return null
 
     if (rate <= 0f) {
@@ -1137,26 +1242,185 @@ private fun estimatedFullBatteryMinutes(report: GameSessionReport): Int? {
     return (100f / rate).roundToInt().coerceAtLeast(1)
 }
 
-private fun thermalVerdict(report: GameSessionReport): String {
-    val start = report.startBatteryTempC
-    val end = report.endBatteryTempC
+private fun samplerReliability(report: GameSessionReport): SamplerReliability {
+    val samples = parseSamplesJsonArray(report.samplesJson)
+    val captured = samples.length()
+    val expected = ((report.durationMs / 2_000L) + 1L).toInt().coerceAtLeast(1)
+    val missed = (expected - captured).coerceAtLeast(0)
 
-    if (end == null) {
-        return "UNKNOWN"
+    var lastElapsed: Long? = null
+    var maxGap = 0L
+
+    for (index in 0 until samples.length()) {
+        val item = samples.optJSONObject(index) ?: continue
+        val elapsed = item.optLong("elapsedMs", -1L)
+
+        if (elapsed < 0L) {
+            continue
+        }
+
+        val previous = lastElapsed
+        if (previous != null) {
+            maxGap = maxGap.coerceAtLeast(elapsed - previous)
+        }
+
+        lastElapsed = elapsed
     }
 
-    val delta = if (start != null) end - start else 0f
+    val reliability = if (expected <= 0) {
+        0f
+    } else {
+        ((captured * 100f) / expected).coerceIn(0f, 100f)
+    }
+
+    return SamplerReliability(
+        expectedSamples = expected,
+        capturedSamples = captured,
+        missedSamples = missed,
+        reliabilityPercent = reliability,
+        maxGapMs = maxGap
+    )
+}
+
+private fun samplerReliabilityVerdict(report: GameSessionReport): String {
+    val reliability = samplerReliability(report).reliabilityPercent
 
     return when {
-        end >= 45f || delta >= 6f -> "HOT"
-        end >= 42f || delta >= 4f -> "HIGH"
-        end >= 39f || delta >= 2f -> "MODERATE"
+        reliability >= 80f -> "GOOD"
+        reliability >= 40f -> "PARTIAL"
+        else -> "POOR"
+    }
+}
+
+private fun refreshAnalysis(report: GameSessionReport): RefreshAnalysis {
+    val samples = parseSamplesJsonArray(report.samplesJson)
+    val values = mutableListOf<Float>()
+
+    for (index in 0 until samples.length()) {
+        val item = samples.optJSONObject(index) ?: continue
+
+        if (!item.has("refreshRateHz") || item.isNull("refreshRateHz")) {
+            continue
+        }
+
+        val value = item.optDouble("refreshRateHz", Double.NaN)
+        if (!value.isNaN() && value > 0.0) {
+            values.add(value.toFloat())
+        }
+    }
+
+    if (values.isEmpty()) {
+        return RefreshAnalysis(
+            minHz = report.refreshRateHz,
+            maxHz = report.refreshRateHz,
+            avgHz = report.refreshRateHz,
+            dominantHz = report.refreshRateHz
+        )
+    }
+
+    val roundedBuckets = values
+        .map { it.roundToInt() }
+        .groupingBy { it }
+        .eachCount()
+
+    val dominant = roundedBuckets.maxByOrNull { it.value }?.key?.toFloat()
+
+    return RefreshAnalysis(
+        minHz = values.minOrNull(),
+        maxHz = values.maxOrNull(),
+        avgHz = values.average().toFloat(),
+        dominantHz = dominant
+    )
+}
+
+private fun thermalAnalysis(report: GameSessionReport): ThermalAnalysis {
+    val samples = parseSamplesJsonArray(report.samplesJson)
+    val values = mutableListOf<Pair<Long, Float>>()
+
+    for (index in 0 until samples.length()) {
+        val item = samples.optJSONObject(index) ?: continue
+
+        if (!item.has("batteryTempC") || item.isNull("batteryTempC")) {
+            continue
+        }
+
+        val value = item.optDouble("batteryTempC", Double.NaN)
+        val elapsed = item.optLong("elapsedMs", -1L)
+
+        if (!value.isNaN() && elapsed >= 0L) {
+            values.add(elapsed to value.toFloat())
+        }
+    }
+
+    if (values.isEmpty()) {
+        val start = report.startBatteryTempC
+        val end = report.endBatteryTempC
+        val delta = if (start != null && end != null) end - start else null
+        val minutes = report.durationMs / 60_000f
+        val growth = if (delta != null && minutes > 0f) delta / minutes else null
+
+        return ThermalAnalysis(
+            minTempC = listOfNotNull(start, end).minOrNull(),
+            maxTempC = listOfNotNull(start, end).maxOrNull(),
+            deltaTempC = delta,
+            growthCPerMinute = growth
+        )
+    }
+
+    val temps = values.map { it.second }
+    val first = values.first().second
+    val last = values.last().second
+    val delta = last - first
+    val minutes = report.durationMs / 60_000f
+
+    return ThermalAnalysis(
+        minTempC = temps.minOrNull(),
+        maxTempC = temps.maxOrNull(),
+        deltaTempC = delta,
+        growthCPerMinute = if (minutes > 0f) delta / minutes else null
+    )
+}
+
+private fun batteryCostUnavailableReason(report: GameSessionReport): String? {
+    val start = report.startBatteryPercent
+    val end = report.endBatteryPercent
+
+    return when {
+        report.batteryChargingInvolved -> "CHARGING"
+        start != null && end != null && end > start -> "BATTERY_INCREASED"
+        start == null || end == null -> "NO_BATTERY_DATA"
+        else -> null
+    }
+}
+
+private fun samplerWarning(report: GameSessionReport): String? {
+    val reliability = samplerReliability(report)
+
+    if (reliability.reliabilityPercent >= 80f) {
+        return null
+    }
+
+    return "Sampler captured only ${reliability.capturedSamples} of expected ~${reliability.expectedSamples} samples. Reliability ${formatRate(reliability.reliabilityPercent)}%, max gap ${formatDurationLong(reliability.maxGapMs)}."
+}
+
+private fun thermalVerdict(report: GameSessionReport): String {
+    val analysis = thermalAnalysis(report)
+    val maxTemp = analysis.maxTempC ?: return "UNKNOWN"
+    val delta = analysis.deltaTempC ?: 0f
+
+    return when {
+        maxTemp >= 45f || delta >= 6f -> "HOT"
+        maxTemp >= 42f || delta >= 4f -> "HIGH"
+        maxTemp >= 39f || delta >= 2f -> "MODERATE"
         else -> "NORMAL"
     }
 }
 
 private fun refreshVerdict(report: GameSessionReport): String {
-    val hz = report.refreshRateHz ?: return "UNKNOWN"
+    val hz = refreshAnalysis(report).dominantHz
+        ?: refreshAnalysis(report).maxHz
+        ?: report.refreshRateHz
+        ?: return "UNKNOWN"
 
     return when {
         hz >= 120f -> "HIGH"
@@ -1167,6 +1431,8 @@ private fun refreshVerdict(report: GameSessionReport): String {
 }
 
 private fun batteryCostVerdict(report: GameSessionReport): String {
+    batteryCostUnavailableReason(report)?.let { return it }
+
     val rate = batteryCostPercentPerMinute(report) ?: return "UNKNOWN"
 
     return when {
@@ -1189,10 +1455,16 @@ private fun buildSessionVerdict(report: GameSessionReport): String {
     when (batteryCostVerdict(report)) {
         "HIGH" -> issues.add("high battery cost")
         "MODERATE" -> issues.add("moderate battery cost")
+        "CHARGING" -> issues.add("battery cost unavailable while charging")
+        "BATTERY_INCREASED" -> issues.add("battery increased during session")
     }
 
     if (refreshVerdict(report) == "LOW") {
         issues.add("low refresh rate")
+    }
+
+    if (samplerReliabilityVerdict(report) == "POOR") {
+        issues.add("sampler reliability is poor")
     }
 
     if (report.endRootAvailable == false) {
@@ -1200,7 +1472,7 @@ private fun buildSessionVerdict(report: GameSessionReport): String {
     }
 
     return if (issues.isEmpty()) {
-        "Stable basic session. No strong thermal, battery, or refresh issue detected in this MVP report."
+        "Stable session. No strong thermal, battery, refresh, or sampler reliability issue detected."
     } else {
         "Detected: ${issues.joinToString(", ")}. Root metrics are collected only after explicit Check Root."
     }
@@ -1261,21 +1533,36 @@ private fun buildTextReport(report: GameSessionReport): String {
         appendLine("Package: ${report.packageName}")
         appendLine("Duration: ${formatDurationLong(report.durationMs)}")
         appendLine()
+        val thermal = thermalAnalysis(report)
+        val refresh = refreshAnalysis(report)
+        val reliability = samplerReliability(report)
+
         appendLine("Thermal:")
         appendLine("- Start temp: ${formatTemp(report.startBatteryTempC)}")
         appendLine("- End temp: ${formatTemp(report.endBatteryTempC)}")
+        appendLine("- Min temp: ${formatTemp(thermal.minTempC)}")
+        appendLine("- Max temp: ${formatTemp(thermal.maxTempC)}")
+        appendLine("- Delta: ${formatSignedTempDelta(thermal.deltaTempC)}")
+        appendLine("- Growth: ${formatTempGrowth(thermal.growthCPerMinute)}")
         appendLine("- Verdict: ${thermalVerdict(report)}")
         appendLine()
         appendLine("Battery:")
         appendLine("- Start battery: ${formatBatteryPercent(report.startBatteryPercent)}")
         appendLine("- End battery: ${formatBatteryPercent(report.endBatteryPercent)}")
-        appendLine("- Drain: ${formatBatteryDrain(report.batteryDrainPercent)}")
+        appendLine("- Start charging: ${formatBoolean(report.startCharging)} / ${report.startPluggedState ?: "--"}")
+        appendLine("- End charging: ${formatBoolean(report.endCharging)} / ${report.endPluggedState ?: "--"}")
+        appendLine("- Drain: ${formatBatteryDrainForReport(report)}")
         appendLine("- Cost: ${formatBatteryCost(report)}")
         appendLine("- Estimated full battery session: ${formatEstimatedFullBattery(report)}")
         appendLine("- Verdict: ${batteryCostVerdict(report)}")
+        appendLine("- Unavailable reason: ${batteryCostUnavailableReason(report) ?: "--"}")
         appendLine()
         appendLine("Display:")
-        appendLine("- Refresh rate: ${formatHz(report.refreshRateHz)}")
+        appendLine("- Refresh rate start/end field: ${formatHz(report.refreshRateHz)}")
+        appendLine("- Min refresh: ${formatHz(refresh.minHz)}")
+        appendLine("- Max refresh: ${formatHz(refresh.maxHz)}")
+        appendLine("- Avg refresh: ${formatHz(refresh.avgHz)}")
+        appendLine("- Dominant refresh: ${formatHz(refresh.dominantHz)}")
         appendLine("- Verdict: ${refreshVerdict(report)}")
         appendLine()
         appendLine("Root:")
@@ -1284,7 +1571,13 @@ private fun buildTextReport(report: GameSessionReport): String {
         appendLine("- Note: root metrics are used only after explicit Check Root in the app.")
         appendLine()
         appendLine("Sampler:")
-        appendLine("- Samples count: ${parseSamplesJsonArray(report.samplesJson).length()}")
+        appendLine("- Samples count: ${reliability.capturedSamples}")
+        appendLine("- Expected samples: ~${reliability.expectedSamples}")
+        appendLine("- Missed samples: ${reliability.missedSamples}")
+        appendLine("- Reliability: ${formatRate(reliability.reliabilityPercent)}%")
+        appendLine("- Max sample gap: ${formatDurationLong(reliability.maxGapMs)}")
+        appendLine("- Verdict: ${samplerReliabilityVerdict(report)}")
+        samplerWarning(report)?.let { appendLine("- Warning: $it") }
         appendLine("- Interval: 2s")
         appendLine()
         appendLine("Start CPU snapshot:")
@@ -1308,13 +1601,22 @@ private fun buildJsonReport(report: GameSessionReport): JSONObject {
         .put("startBatteryTempC", report.startBatteryTempC ?: JSONObject.NULL)
         .put("endBatteryTempC", report.endBatteryTempC ?: JSONObject.NULL)
         .put("thermalVerdict", thermalVerdict(report))
+        .put("thermalAnalysis", buildThermalAnalysisJson(report))
         .put("startBatteryPercent", report.startBatteryPercent ?: JSONObject.NULL)
         .put("endBatteryPercent", report.endBatteryPercent ?: JSONObject.NULL)
+        .put("startCharging", report.startCharging ?: JSONObject.NULL)
+        .put("endCharging", report.endCharging ?: JSONObject.NULL)
+        .put("startPluggedState", report.startPluggedState ?: JSONObject.NULL)
+        .put("endPluggedState", report.endPluggedState ?: JSONObject.NULL)
+        .put("batteryChargingInvolved", report.batteryChargingInvolved)
+        .put("batteryDeltaPercent", report.batteryDeltaPercent ?: JSONObject.NULL)
         .put("batteryDrainPercent", report.batteryDrainPercent ?: JSONObject.NULL)
         .put("batteryCostPercentPerMinute", batteryCostPercentPerMinute(report) ?: JSONObject.NULL)
         .put("estimatedFullBatteryMinutes", estimatedFullBatteryMinutes(report) ?: JSONObject.NULL)
         .put("batteryCostVerdict", batteryCostVerdict(report))
+        .put("batteryCostUnavailableReason", batteryCostUnavailableReason(report) ?: JSONObject.NULL)
         .put("refreshRateHz", report.refreshRateHz ?: JSONObject.NULL)
+        .put("refreshAnalysis", buildRefreshAnalysisJson(report))
         .put("refreshVerdict", refreshVerdict(report))
         .put("startRootAvailable", report.startRootAvailable ?: JSONObject.NULL)
         .put("endRootAvailable", report.endRootAvailable ?: JSONObject.NULL)
@@ -1322,10 +1624,38 @@ private fun buildJsonReport(report: GameSessionReport): JSONObject {
         .put("endCpuSnapshot", report.endCpuSnapshot ?: JSONObject.NULL)
         .put("rootNote", "Root metrics are used only after explicit Check Root in the app.")
         .put("samplesIntervalMs", 2000)
-        .put("samplesCount", parseSamplesJsonArray(report.samplesJson).length())
+        .put("samplesCount", samplerReliability(report).capturedSamples)
+        .put("samplesExpected", samplerReliability(report).expectedSamples)
+        .put("samplesMissed", samplerReliability(report).missedSamples)
+        .put("samplerReliabilityPercent", samplerReliability(report).reliabilityPercent)
+        .put("samplerMaxGapMs", samplerReliability(report).maxGapMs)
+        .put("samplerVerdict", samplerReliabilityVerdict(report))
+        .put("samplerWarning", samplerWarning(report) ?: JSONObject.NULL)
         .put("samples", parseSamplesJsonArray(report.samplesJson))
         .put("sessionVerdict", buildSessionVerdict(report))
         .put("completedAtMs", report.completedAtMs)
+}
+
+private fun buildThermalAnalysisJson(report: GameSessionReport): JSONObject {
+    val analysis = thermalAnalysis(report)
+
+    return JSONObject()
+        .put("minTempC", analysis.minTempC ?: JSONObject.NULL)
+        .put("maxTempC", analysis.maxTempC ?: JSONObject.NULL)
+        .put("deltaTempC", analysis.deltaTempC ?: JSONObject.NULL)
+        .put("growthCPerMinute", analysis.growthCPerMinute ?: JSONObject.NULL)
+        .put("verdict", thermalVerdict(report))
+}
+
+private fun buildRefreshAnalysisJson(report: GameSessionReport): JSONObject {
+    val analysis = refreshAnalysis(report)
+
+    return JSONObject()
+        .put("minRefreshHz", analysis.minHz ?: JSONObject.NULL)
+        .put("maxRefreshHz", analysis.maxHz ?: JSONObject.NULL)
+        .put("avgRefreshHz", analysis.avgHz ?: JSONObject.NULL)
+        .put("dominantRefreshHz", analysis.dominantHz ?: JSONObject.NULL)
+        .put("verdict", refreshVerdict(report))
 }
 
 private fun parseSamplesJsonArray(raw: String?): JSONArray {
@@ -1872,19 +2202,28 @@ private fun NxiReportCard(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             NxiReportPill("DURATION", formatDurationLong(report.durationMs))
-            NxiReportPill("THERMAL", thermalVerdict(report))
-            NxiReportPill("START TEMP", formatTemp(report.startBatteryTempC))
-            NxiReportPill("END TEMP", formatTemp(report.endBatteryTempC))
-            NxiReportPill("DRAIN", formatBatteryDrain(report.batteryDrainPercent))
+            NxiReportPill("THERMAL", "${thermalVerdict(report)} / max ${formatTemp(thermalAnalysis(report).maxTempC)}")
+            NxiReportPill("TEMP DELTA", formatSignedTempDelta(thermalAnalysis(report).deltaTempC))
+            NxiReportPill("BATTERY", batteryCostVerdict(report))
+            NxiReportPill("DRAIN", formatBatteryDrainForReport(report))
             NxiReportPill("COST", formatBatteryCost(report))
             NxiReportPill("ESTIMATE", formatEstimatedFullBattery(report))
-            NxiReportPill("REFRESH", "${formatHz(report.refreshRateHz)} / ${refreshVerdict(report)}")
+            NxiReportPill("REFRESH", "${formatHz(refreshAnalysis(report).dominantHz)} / ${refreshVerdict(report)}")
+            NxiReportPill("SAMPLER", "${samplerReliabilityVerdict(report)} / ${formatRate(samplerReliability(report).reliabilityPercent)}%")
             NxiReportPill("ROOT", formatRootState(report.endRootAvailable))
         }
 
         Spacer(modifier = Modifier.height(14.dp))
 
         NxiVerdictBlock(text = buildSessionVerdict(report))
+
+        samplerWarning(report)?.let { warning ->
+            Spacer(modifier = Modifier.height(12.dp))
+            NxiCodeBlock(
+                title = "SAMPLER WARNING",
+                value = warning
+            )
+        }
 
         val cpuSnapshot = report.endCpuSnapshot ?: report.startCpuSnapshot
 
@@ -2083,7 +2422,7 @@ private fun NxiHistoryRow(report: GameSessionReport) {
         Spacer(modifier = Modifier.height(4.dp))
 
         Text(
-            text = "${thermalVerdict(report)} / ${formatBatteryCost(report)} / ${formatHz(report.refreshRateHz)}",
+            text = "${thermalVerdict(report)} / ${formatBatteryCost(report)} / ${formatHz(refreshAnalysis(report).dominantHz)} / ${samplerReliabilityVerdict(report)}",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace
@@ -2205,6 +2544,33 @@ private fun formatBatteryPercent(value: Int?): String {
 
 private fun formatBatteryDrain(value: Int?): String {
     return value?.let { "$it%" } ?: "--"
+}
+
+private fun formatBatteryDrainForReport(report: GameSessionReport): String {
+    batteryCostUnavailableReason(report)?.let { reason ->
+        return reason
+    }
+
+    return formatBatteryDrain(report.batteryDrainPercent)
+}
+
+private fun formatBoolean(value: Boolean?): String {
+    return when (value) {
+        true -> "yes"
+        false -> "no"
+        null -> "--"
+    }
+}
+
+private fun formatSignedTempDelta(value: Float?): String {
+    return value?.let {
+        val sign = if (it >= 0f) "+" else ""
+        "$sign${formatRate(it)}°C"
+    } ?: "--"
+}
+
+private fun formatTempGrowth(value: Float?): String {
+    return value?.let { "${formatRate(it)}°C/min" } ?: "--"
 }
 
 private fun formatBatteryCost(report: GameSessionReport): String {

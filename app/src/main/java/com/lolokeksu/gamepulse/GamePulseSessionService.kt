@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.WindowManager
 import java.util.concurrent.TimeUnit
@@ -20,6 +21,7 @@ import org.json.JSONObject
 
 class GamePulseSessionService : Service() {
     private var workerThread: Thread? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     @Volatile
     private var running = false
@@ -35,6 +37,7 @@ class GamePulseSessionService : Service() {
         rootMetricsEnabled = intent?.getBooleanExtra(EXTRA_ROOT_METRICS_ENABLED, false) ?: false
 
         startForegroundCompat()
+        acquireSamplerWakeLock()
         startSamplerWorker()
 
         return START_STICKY
@@ -44,6 +47,7 @@ class GamePulseSessionService : Service() {
         running = false
         workerThread?.interrupt()
         workerThread = null
+        releaseSamplerWakeLock()
         super.onDestroy()
     }
 
@@ -95,6 +99,30 @@ class GamePulseSessionService : Service() {
         manager.createNotificationChannel(channel)
     }
 
+    private fun acquireSamplerWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            return
+        }
+
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "GamePulseAnalyzer:SessionSampler"
+        ).apply {
+            setReferenceCounted(false)
+            acquire(MAX_SESSION_MS)
+        }
+    }
+
+    private fun releaseSamplerWakeLock() {
+        try {
+            wakeLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        } finally {
+            wakeLock = null
+        }
+    }
+
     private fun startSamplerWorker() {
         if (workerThread?.isAlive == true) {
             return
@@ -106,12 +134,15 @@ class GamePulseSessionService : Service() {
             while (running) {
                 try {
                     collectSample()
-
                     Thread.sleep(SAMPLE_INTERVAL_MS)
                 } catch (_: InterruptedException) {
                     running = false
                 } catch (_: Exception) {
-                    Thread.sleep(SAMPLE_INTERVAL_MS)
+                    try {
+                        Thread.sleep(SAMPLE_INTERVAL_MS)
+                    } catch (_: InterruptedException) {
+                        running = false
+                    }
                 }
             }
         }.apply {
@@ -149,6 +180,8 @@ class GamePulseSessionService : Service() {
             JSONArray()
         }
 
+        val batteryState = readBatteryState()
+
         val cpuSnapshot = if (rootMetricsEnabled && array.length() % CPU_SAMPLE_EVERY_N_SAMPLES == 0) {
             readCpuFreqSnapshotWithRoot()
         } else {
@@ -157,8 +190,10 @@ class GamePulseSessionService : Service() {
 
         val sample = JSONObject()
             .put("elapsedMs", elapsedMs)
-            .put("batteryTempC", readBatteryTemperatureC() ?: JSONObject.NULL)
-            .put("batteryPercent", readBatteryPercent() ?: JSONObject.NULL)
+            .put("batteryTempC", batteryState.tempC ?: JSONObject.NULL)
+            .put("batteryPercent", batteryState.percent ?: JSONObject.NULL)
+            .put("charging", batteryState.charging)
+            .put("pluggedState", batteryState.pluggedState)
             .put("refreshRateHz", readRefreshRateHz() ?: JSONObject.NULL)
             .put("rootMetricsEnabled", rootMetricsEnabled)
             .put("cpuSnapshot", cpuSnapshot ?: JSONObject.NULL)
@@ -182,30 +217,56 @@ class GamePulseSessionService : Service() {
             .apply()
     }
 
-    private fun readBatteryTemperatureC(): Float? {
-        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            ?: return null
+    private data class BatteryState(
+        val tempC: Float?,
+        val percent: Int?,
+        val charging: Boolean,
+        val pluggedState: String
+    )
 
-        val rawTemp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
-        if (rawTemp == Int.MIN_VALUE) {
-            return null
+    private fun readBatteryState(): BatteryState {
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+
+        if (intent == null) {
+            return BatteryState(
+                tempC = null,
+                percent = null,
+                charging = false,
+                pluggedState = "UNKNOWN"
+            )
         }
 
-        return rawTemp / 10f
-    }
-
-    private fun readBatteryPercent(): Int? {
-        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            ?: return null
+        val rawTemp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+        val tempC = if (rawTemp == Int.MIN_VALUE) null else rawTemp / 10f
 
         val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-
-        if (level < 0 || scale <= 0) {
-            return null
+        val percent = if (level >= 0 && scale > 0) {
+            ((level * 100f) / scale).roundToInt().coerceIn(0, 100)
+        } else {
+            null
         }
 
-        return ((level * 100f) / scale).roundToInt().coerceIn(0, 100)
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+
+        val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+        val pluggedState = when {
+            plugged and BatteryManager.BATTERY_PLUGGED_AC != 0 -> "AC"
+            plugged and BatteryManager.BATTERY_PLUGGED_USB != 0 -> "USB"
+            plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS != 0 -> "WIRELESS"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                plugged and BatteryManager.BATTERY_PLUGGED_DOCK != 0 -> "DOCK"
+            else -> "NONE"
+        }
+
+        return BatteryState(
+            tempC = tempC,
+            percent = percent,
+            charging = charging || pluggedState != "NONE",
+            pluggedState = pluggedState
+        )
     }
 
     private fun readRefreshRateHz(): Float? {
