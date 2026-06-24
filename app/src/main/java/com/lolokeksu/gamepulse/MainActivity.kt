@@ -165,10 +165,8 @@ private fun loadLaunchableGames(packageManager: PackageManager): List<GameApp> {
                 isGameCategory = appInfo.category == ApplicationInfo.CATEGORY_GAME
             )
         }
-        .sortedWith(
-            compareByDescending<GameApp> { it.isGameCategory }
-                .thenBy { it.label.lowercase() }
-        )
+        .filter { it.isGameCategory }
+        .sortedBy { it.label.lowercase() }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -364,7 +362,7 @@ private fun NxiGamesCard(
 
         if (games.isEmpty()) {
             Text(
-                text = "No launchable apps detected.",
+                text = "No games detected. Some games may not declare Android game category.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
@@ -408,7 +406,7 @@ private fun NxiGameRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = if (game.isGameCategory) "GAME" else "APP",
+                text = "GAME",
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
