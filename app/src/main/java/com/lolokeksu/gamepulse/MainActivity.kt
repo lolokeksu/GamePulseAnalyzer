@@ -59,6 +59,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lolokeksu.gamepulse.ui.theme.NxiTheme
 import kotlin.math.roundToInt
+import org.json.JSONArray
+import org.json.JSONObject
 
 data class GameApp(
     val label: String,
@@ -104,6 +106,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
     var games by remember { mutableStateOf<List<GameApp>>(emptyList()) }
     var selectedGame by remember { mutableStateOf<GameApp?>(null) }
     var lastReport by remember { mutableStateOf<GameSessionReport?>(null) }
+    var reportHistory by remember { mutableStateOf<List<GameSessionReport>>(emptyList()) }
     var manualPackageInput by remember { mutableStateOf("") }
     var manualStatus by remember { mutableStateOf<String?>(null) }
 
@@ -111,11 +114,13 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
         games = loadLaunchableGames(context, packageManager)
         selectedGame = games.firstOrNull()
         lastReport = loadLastReport(context)
+        reportHistory = loadReportHistory(context)
     }
 
     LaunchedEffect(refreshTick.value) {
         finishActiveSessionIfNeeded(context)?.let { report ->
             lastReport = report
+            reportHistory = loadReportHistory(context)
         }
     }
 
@@ -191,6 +196,8 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
             lastReport?.let { report ->
                 NxiReportCard(report = report)
             }
+
+            NxiHistoryCard(history = reportHistory)
 
             NxiPrimaryButton(
                 text = "Start Analyze",
@@ -338,6 +345,8 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         .putLong("last_completed_at_ms", report.completedAtMs)
         .apply()
 
+    appendReportHistory(context, report)
+
     return report
 }
 
@@ -359,6 +368,92 @@ private fun loadLastReport(context: Context): GameSessionReport? {
         completedAtMs = prefs.getLong("last_completed_at_ms", 0L)
     )
 }
+
+private fun appendReportHistory(
+    context: Context,
+    report: GameSessionReport
+) {
+    val prefs = context.getSharedPreferences("gamepulse_sessions", Context.MODE_PRIVATE)
+    val currentHistory = loadReportHistory(context).toMutableList()
+
+    currentHistory.removeAll {
+        it.completedAtMs == report.completedAtMs && it.packageName == report.packageName
+    }
+
+    currentHistory.add(0, report)
+
+    val array = JSONArray()
+
+    currentHistory
+        .take(10)
+        .forEach { item ->
+            val objectValue = JSONObject()
+                .put("gameLabel", item.gameLabel)
+                .put("packageName", item.packageName)
+                .put("durationMs", item.durationMs)
+                .put("startBatteryTempC", item.startBatteryTempC ?: JSONObject.NULL)
+                .put("endBatteryTempC", item.endBatteryTempC ?: JSONObject.NULL)
+                .put("refreshRateHz", item.refreshRateHz ?: JSONObject.NULL)
+                .put("completedAtMs", item.completedAtMs)
+
+            array.put(objectValue)
+        }
+
+    prefs.edit()
+        .putString("history_json", array.toString())
+        .apply()
+}
+
+private fun loadReportHistory(context: Context): List<GameSessionReport> {
+    val prefs = context.getSharedPreferences("gamepulse_sessions", Context.MODE_PRIVATE)
+    val raw = prefs.getString("history_json", null) ?: return emptyList()
+
+    return try {
+        val array = JSONArray(raw)
+
+        buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+
+                val durationMs = item.optLong("durationMs", 0L)
+                val completedAtMs = item.optLong("completedAtMs", 0L)
+
+                if (durationMs <= 0L || completedAtMs <= 0L) {
+                    continue
+                }
+
+                add(
+                    GameSessionReport(
+                        gameLabel = item.optString("gameLabel", "Unknown game"),
+                        packageName = item.optString("packageName", "unknown.package"),
+                        durationMs = durationMs,
+                        startBatteryTempC = item.optNullableFloat("startBatteryTempC"),
+                        endBatteryTempC = item.optNullableFloat("endBatteryTempC"),
+                        refreshRateHz = item.optNullableFloat("refreshRateHz"),
+                        completedAtMs = completedAtMs
+                    )
+                )
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun JSONObject.optNullableFloat(name: String): Float? {
+    if (!has(name) || isNull(name)) {
+        return null
+    }
+
+    val value = optDouble(name, Double.NaN)
+
+    return if (value.isNaN()) {
+        null
+    } else {
+        value.toFloat()
+    }
+}
+
 
 private fun readBatteryTemperatureC(context: Context): Float? {
     val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
@@ -847,6 +942,109 @@ private fun NxiReportCard(report: GameSessionReport) {
             NxiReportPill("END TEMP", formatTemp(report.endBatteryTempC))
             NxiReportPill("REFRESH", formatHz(report.refreshRateHz))
         }
+    }
+}
+
+@Composable
+private fun NxiHistoryCard(history: List<GameSessionReport>) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "SESSION HISTORY",
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        if (history.isEmpty()) {
+            Text(
+                text = "No saved sessions yet.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
+        } else {
+            history.take(5).forEachIndexed { index, report ->
+                if (index > 0) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                NxiHistoryRow(report = report)
+            }
+
+            if (history.size > 5) {
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = "+${history.size - 5} more saved sessions",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NxiHistoryRow(report: GameSessionReport) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.background)
+            .padding(12.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "SESSION",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            )
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            Text(
+                text = formatDurationLong(report.durationMs),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = report.gameLabel,
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = "${formatTemp(report.startBatteryTempC)} → ${formatTemp(report.endBatteryTempC)}  /  ${formatHz(report.refreshRateHz)}",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace
+        )
     }
 }
 
