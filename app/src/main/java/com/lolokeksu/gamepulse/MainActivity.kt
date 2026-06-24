@@ -1,9 +1,14 @@
 package com.lolokeksu.gamepulse
 
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.BatteryManager
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
@@ -12,24 +17,23 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -37,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,6 +54,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lolokeksu.gamepulse.ui.theme.NxiTheme
+import kotlin.math.roundToInt
 
 data class GameApp(
     val label: String,
@@ -56,29 +62,54 @@ data class GameApp(
     val isGameCategory: Boolean
 )
 
+data class GameSessionReport(
+    val gameLabel: String,
+    val packageName: String,
+    val durationMs: Long,
+    val startBatteryTempC: Float?,
+    val endBatteryTempC: Float?,
+    val refreshRateHz: Float?,
+    val completedAtMs: Long
+)
+
 class MainActivity : ComponentActivity() {
+    private val refreshTick = mutableStateOf(0L)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         setContent {
             NxiTheme {
-                GamePulseApp()
+                GamePulseApp(refreshTick = refreshTick)
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshTick.value = SystemClock.elapsedRealtime()
     }
 }
 
 @Composable
-private fun GamePulseApp() {
+private fun GamePulseApp(refreshTick: MutableState<Long>) {
     val context = LocalContext.current
     val packageManager = context.packageManager
 
     var games by remember { mutableStateOf<List<GameApp>>(emptyList()) }
     var selectedGame by remember { mutableStateOf<GameApp?>(null) }
+    var lastReport by remember { mutableStateOf<GameSessionReport?>(null) }
 
     LaunchedEffect(Unit) {
         games = loadLaunchableGames(packageManager)
         selectedGame = games.firstOrNull()
+        lastReport = loadLastReport(context)
+    }
+
+    LaunchedEffect(refreshTick.value) {
+        finishActiveSessionIfNeeded(context)?.let { report ->
+            lastReport = report
+        }
     }
 
     Surface(
@@ -94,7 +125,10 @@ private fun GamePulseApp() {
         ) {
             NxiHeader()
 
-            NxiSessionCard(selectedGame = selectedGame)
+            NxiSessionCard(
+                selectedGame = selectedGame,
+                lastReport = lastReport
+            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -109,9 +143,9 @@ private fun GamePulseApp() {
 
                 NxiMetricCard(
                     modifier = Modifier.weight(1f),
-                    title = "MODE",
-                    value = "MVP",
-                    caption = "launcher"
+                    title = "LAST",
+                    value = lastReport?.let { formatDurationShort(it.durationMs) } ?: "--",
+                    caption = "session"
                 )
             }
 
@@ -121,6 +155,10 @@ private fun GamePulseApp() {
                 onGameSelected = { selectedGame = it }
             )
 
+            lastReport?.let { report ->
+                NxiReportCard(report = report)
+            }
+
             Spacer(modifier = Modifier.weight(1f))
 
             NxiPrimaryButton(
@@ -129,16 +167,113 @@ private fun GamePulseApp() {
                 enabled = selectedGame != null,
                 onClick = {
                     selectedGame?.let { game ->
-                        val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName)
-                        if (launchIntent != null) {
-                            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            context.startActivity(launchIntent)
-                        }
+                        startGameSession(context, game)
                     }
                 }
             )
         }
     }
+}
+
+private fun startGameSession(context: Context, game: GameApp) {
+    val packageManager = context.packageManager
+    val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName) ?: return
+
+    val prefs = context.getSharedPreferences("gamepulse_sessions", Context.MODE_PRIVATE)
+
+    prefs.edit()
+        .putBoolean("active", true)
+        .putString("game_label", game.label)
+        .putString("package_name", game.packageName)
+        .putLong("start_elapsed_ms", SystemClock.elapsedRealtime())
+        .putFloat("start_battery_temp_c", readBatteryTemperatureC(context) ?: -1f)
+        .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
+        .apply()
+
+    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    context.startActivity(launchIntent)
+}
+
+private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
+    val prefs = context.getSharedPreferences("gamepulse_sessions", Context.MODE_PRIVATE)
+
+    if (!prefs.getBoolean("active", false)) {
+        return null
+    }
+
+    val startElapsedMs = prefs.getLong("start_elapsed_ms", 0L)
+    if (startElapsedMs <= 0L) {
+        prefs.edit().clear().apply()
+        return null
+    }
+
+    val nowElapsedMs = SystemClock.elapsedRealtime()
+    val durationMs = nowElapsedMs - startElapsedMs
+
+    if (durationMs < 3_000L) {
+        return null
+    }
+
+    val report = GameSessionReport(
+        gameLabel = prefs.getString("game_label", "Unknown game") ?: "Unknown game",
+        packageName = prefs.getString("package_name", "unknown.package") ?: "unknown.package",
+        durationMs = durationMs,
+        startBatteryTempC = prefs.getFloat("start_battery_temp_c", -1f).takeIf { it >= 0f },
+        endBatteryTempC = readBatteryTemperatureC(context),
+        refreshRateHz = prefs.getFloat("refresh_rate_hz", -1f).takeIf { it >= 0f },
+        completedAtMs = System.currentTimeMillis()
+    )
+
+    prefs.edit()
+        .putBoolean("active", false)
+        .putString("last_game_label", report.gameLabel)
+        .putString("last_package_name", report.packageName)
+        .putLong("last_duration_ms", report.durationMs)
+        .putFloat("last_start_battery_temp_c", report.startBatteryTempC ?: -1f)
+        .putFloat("last_end_battery_temp_c", report.endBatteryTempC ?: -1f)
+        .putFloat("last_refresh_rate_hz", report.refreshRateHz ?: -1f)
+        .putLong("last_completed_at_ms", report.completedAtMs)
+        .apply()
+
+    return report
+}
+
+private fun loadLastReport(context: Context): GameSessionReport? {
+    val prefs = context.getSharedPreferences("gamepulse_sessions", Context.MODE_PRIVATE)
+    val durationMs = prefs.getLong("last_duration_ms", 0L)
+
+    if (durationMs <= 0L) {
+        return null
+    }
+
+    return GameSessionReport(
+        gameLabel = prefs.getString("last_game_label", "Unknown game") ?: "Unknown game",
+        packageName = prefs.getString("last_package_name", "unknown.package") ?: "unknown.package",
+        durationMs = durationMs,
+        startBatteryTempC = prefs.getFloat("last_start_battery_temp_c", -1f).takeIf { it >= 0f },
+        endBatteryTempC = prefs.getFloat("last_end_battery_temp_c", -1f).takeIf { it >= 0f },
+        refreshRateHz = prefs.getFloat("last_refresh_rate_hz", -1f).takeIf { it >= 0f },
+        completedAtMs = prefs.getLong("last_completed_at_ms", 0L)
+    )
+}
+
+private fun readBatteryTemperatureC(context: Context): Float? {
+    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        ?: return null
+
+    val rawTemp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+    if (rawTemp == Int.MIN_VALUE) {
+        return null
+    }
+
+    return rawTemp / 10f
+}
+
+private fun readRefreshRateHz(context: Context): Float? {
+    val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        ?: return null
+
+    return windowManager.defaultDisplay?.refreshRate
 }
 
 private fun loadLaunchableGames(packageManager: PackageManager): List<GameApp> {
@@ -251,7 +386,10 @@ private fun NxiTrafficDots() {
 }
 
 @Composable
-private fun NxiSessionCard(selectedGame: GameApp?) {
+private fun NxiSessionCard(
+    selectedGame: GameApp?,
+    lastReport: GameSessionReport?
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -280,7 +418,7 @@ private fun NxiSessionCard(selectedGame: GameApp?) {
 
         Text(
             text = selectedGame?.packageName
-                ?: "Choose a game below. First MVP build will launch the game and prepare the session analyzer base.",
+                ?: "Choose a game below. Start Analyze will launch the game and create a session report after return.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall
         )
@@ -295,6 +433,17 @@ private fun NxiSessionCard(selectedGame: GameApp?) {
             color = MaterialTheme.colorScheme.primary,
             trackColor = MaterialTheme.colorScheme.outline
         )
+
+        if (lastReport != null) {
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Text(
+                text = "Last report: ${formatDurationShort(lastReport.durationMs)}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace
+            )
+        }
     }
 }
 
@@ -345,7 +494,7 @@ private fun NxiGamesCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .height(300.dp)
+            .height(260.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(16.dp)
@@ -388,7 +537,7 @@ private fun NxiGameRow(
     selected: Boolean,
     onClick: () -> Unit
 ) {
-    val borderColor = if (selected) {
+    val statusColor = if (selected) {
         MaterialTheme.colorScheme.primary
     } else {
         MaterialTheme.colorScheme.outline
@@ -421,7 +570,7 @@ private fun NxiGameRow(
 
             Text(
                 text = if (selected) "SELECTED" else "TAP TO SELECT",
-                color = borderColor,
+                color = statusColor,
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.SemiBold
@@ -444,6 +593,86 @@ private fun NxiGameRow(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun NxiReportCard(report: GameSessionReport) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "SESSION REPORT",
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = report.gameLabel,
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = report.packageName,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            NxiReportPill("DURATION", formatDurationLong(report.durationMs))
+            NxiReportPill("START TEMP", formatTemp(report.startBatteryTempC))
+            NxiReportPill("END TEMP", formatTemp(report.endBatteryTempC))
+            NxiReportPill("REFRESH", formatHz(report.refreshRateHz))
+        }
+    }
+}
+
+@Composable
+private fun NxiReportPill(
+    label: String,
+    value: String
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.background)
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        Text(
+            text = label,
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = value,
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold
         )
     }
 }
@@ -492,4 +721,36 @@ private fun NxiPrimaryButton(
             fontWeight = FontWeight.SemiBold
         )
     }
+}
+
+private fun formatDurationShort(durationMs: Long): String {
+    val totalSeconds = durationMs / 1000L
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+
+    return if (minutes > 0L) {
+        "${minutes}m"
+    } else {
+        "${seconds}s"
+    }
+}
+
+private fun formatDurationLong(durationMs: Long): String {
+    val totalSeconds = durationMs / 1000L
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+
+    return if (minutes > 0L) {
+        "${minutes}m ${seconds}s"
+    } else {
+        "${seconds}s"
+    }
+}
+
+private fun formatTemp(value: Float?): String {
+    return value?.let { "${((it * 10f).roundToInt() / 10f)}°C" } ?: "--"
+}
+
+private fun formatHz(value: Float?): String {
+    return value?.let { "${it.roundToInt()} Hz" } ?: "--"
 }
