@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,8 +32,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -59,7 +63,8 @@ import kotlin.math.roundToInt
 data class GameApp(
     val label: String,
     val packageName: String,
-    val isGameCategory: Boolean
+    val isGameCategory: Boolean,
+    val isManual: Boolean
 )
 
 data class GameSessionReport(
@@ -99,9 +104,11 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
     var games by remember { mutableStateOf<List<GameApp>>(emptyList()) }
     var selectedGame by remember { mutableStateOf<GameApp?>(null) }
     var lastReport by remember { mutableStateOf<GameSessionReport?>(null) }
+    var manualPackageInput by remember { mutableStateOf("") }
+    var manualStatus by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
-        games = loadLaunchableGames(packageManager)
+        games = loadLaunchableGames(context, packageManager)
         selectedGame = games.firstOrNull()
         lastReport = loadLastReport(context)
     }
@@ -120,6 +127,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
             modifier = Modifier
                 .fillMaxSize()
                 .safeDrawingPadding()
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
@@ -149,6 +157,31 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
                 )
             }
 
+            NxiManualGameCard(
+                packageInput = manualPackageInput,
+                status = manualStatus,
+                onPackageInputChanged = {
+                    manualPackageInput = it
+                    manualStatus = null
+                },
+                onAddClicked = {
+                    val addedGame = addManualGame(
+                        context = context,
+                        packageManager = packageManager,
+                        rawPackageName = manualPackageInput
+                    )
+
+                    if (addedGame == null) {
+                        manualStatus = "Package not found or app has no launcher activity."
+                    } else {
+                        games = loadLaunchableGames(context, packageManager)
+                        selectedGame = games.firstOrNull { it.packageName == addedGame.packageName }
+                        manualPackageInput = ""
+                        manualStatus = "Added: ${addedGame.label}"
+                    }
+                }
+            )
+
             NxiGamesCard(
                 games = games,
                 selectedGame = selectedGame,
@@ -158,8 +191,6 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
             lastReport?.let { report ->
                 NxiReportCard(report = report)
             }
-
-            Spacer(modifier = Modifier.weight(1f))
 
             NxiPrimaryButton(
                 text = "Start Analyze",
@@ -171,7 +202,79 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
                     }
                 }
             )
+
+            Spacer(modifier = Modifier.height(8.dp))
         }
+    }
+}
+
+private fun addManualGame(
+    context: Context,
+    packageManager: PackageManager,
+    rawPackageName: String
+): GameApp? {
+    val packageName = rawPackageName.trim()
+
+    if (packageName.isBlank()) {
+        return null
+    }
+
+    val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        ?: return null
+
+    val applicationInfo = try {
+        packageManager.getApplicationInfo(packageName, 0)
+    } catch (_: PackageManager.NameNotFoundException) {
+        return null
+    }
+
+    val label = applicationInfo.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+        .ifBlank { packageName }
+
+    val prefs = context.getSharedPreferences("gamepulse_manual_games", Context.MODE_PRIVATE)
+    val current = prefs.getStringSet("manual_packages", emptySet()).orEmpty().toMutableSet()
+    current.add(packageName)
+
+    prefs.edit()
+        .putStringSet("manual_packages", current)
+        .apply()
+
+    return GameApp(
+        label = label,
+        packageName = packageName,
+        isGameCategory = applicationInfo.category == ApplicationInfo.CATEGORY_GAME,
+        isManual = true
+    )
+}
+
+private fun loadManualGames(
+    context: Context,
+    packageManager: PackageManager
+): List<GameApp> {
+    val prefs = context.getSharedPreferences("gamepulse_manual_games", Context.MODE_PRIVATE)
+    val packages = prefs.getStringSet("manual_packages", emptySet()).orEmpty()
+
+    return packages.mapNotNull { packageName ->
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent == null) {
+            return@mapNotNull null
+        }
+
+        val applicationInfo = try {
+            packageManager.getApplicationInfo(packageName, 0)
+        } catch (_: PackageManager.NameNotFoundException) {
+            return@mapNotNull null
+        }
+
+        val label = applicationInfo.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+            .ifBlank { packageName }
+
+        GameApp(
+            label = label,
+            packageName = packageName,
+            isGameCategory = applicationInfo.category == ApplicationInfo.CATEGORY_GAME,
+            isManual = true
+        )
     }
 }
 
@@ -276,14 +379,17 @@ private fun readRefreshRateHz(context: Context): Float? {
     return windowManager.defaultDisplay?.refreshRate
 }
 
-private fun loadLaunchableGames(packageManager: PackageManager): List<GameApp> {
+private fun loadLaunchableGames(
+    context: Context,
+    packageManager: PackageManager
+): List<GameApp> {
     val launcherIntent = Intent(Intent.ACTION_MAIN, null).apply {
         addCategory(Intent.CATEGORY_LAUNCHER)
     }
 
     val resolvedApps = packageManager.queryIntentActivities(launcherIntent, 0)
 
-    return resolvedApps
+    val detectedGames = resolvedApps
         .mapNotNull { resolveInfo ->
             val activityInfo = resolveInfo.activityInfo ?: return@mapNotNull null
             val appInfo = activityInfo.applicationInfo ?: return@mapNotNull null
@@ -297,11 +403,21 @@ private fun loadLaunchableGames(packageManager: PackageManager): List<GameApp> {
             GameApp(
                 label = label.ifBlank { packageName },
                 packageName = packageName,
-                isGameCategory = appInfo.category == ApplicationInfo.CATEGORY_GAME
+                isGameCategory = appInfo.category == ApplicationInfo.CATEGORY_GAME,
+                isManual = false
             )
         }
         .filter { it.isGameCategory }
-        .sortedBy { it.label.lowercase() }
+
+    val manualGames = loadManualGames(context, packageManager)
+
+    return (detectedGames + manualGames)
+        .distinctBy { it.packageName }
+        .sortedWith(
+            compareByDescending<GameApp> { it.isGameCategory }
+                .thenByDescending { it.isManual }
+                .thenBy { it.label.lowercase() }
+        )
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -356,7 +472,7 @@ private fun NxiHeader() {
             NxiChip("GAME SCAN")
             NxiChip("SESSION")
             NxiChip("REPORT")
-            NxiChip("ROOT LATER")
+            NxiChip("MANUAL ADD")
         }
     }
 }
@@ -486,6 +602,93 @@ private fun NxiMetricCard(
 }
 
 @Composable
+private fun NxiManualGameCard(
+    packageInput: String,
+    status: String?,
+    onPackageInputChanged: (String) -> Unit,
+    onAddClicked: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "ADD MISSING GAME",
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Text(
+            text = "Use package name if Android did not mark the game automatically.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        BasicTextField(
+            value = packageInput,
+            onValueChange = onPackageInputChanged,
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                color = MaterialTheme.colorScheme.onBackground,
+                fontFamily = FontFamily.Monospace
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(MaterialTheme.colorScheme.background)
+                .border(
+                    width = 1.dp,
+                    color = MaterialTheme.colorScheme.outline,
+                    shape = RoundedCornerShape(16.dp)
+                )
+                .padding(horizontal = 14.dp, vertical = 14.dp),
+            decorationBox = { innerTextField ->
+                if (packageInput.isBlank()) {
+                    Text(
+                        text = "com.example.game",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                innerTextField()
+            }
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        NxiPrimaryButton(
+            text = "Add Game",
+            modifier = Modifier.fillMaxWidth(),
+            enabled = packageInput.isNotBlank(),
+            onClick = onAddClicked
+        )
+
+        if (status != null) {
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Text(
+                text = status,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+}
+
+@Composable
 private fun NxiGamesCard(
     games: List<GameApp>,
     selectedGame: GameApp?,
@@ -511,7 +714,7 @@ private fun NxiGamesCard(
 
         if (games.isEmpty()) {
             Text(
-                text = "No games detected. Some games may not declare Android game category.",
+                text = "No games detected. Add game manually by package name.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
@@ -555,7 +758,7 @@ private fun NxiGameRow(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "GAME",
+                text = if (game.isManual && !game.isGameCategory) "MANUAL" else "GAME",
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
