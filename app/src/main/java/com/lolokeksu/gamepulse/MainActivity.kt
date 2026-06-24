@@ -1,10 +1,14 @@
 package com.lolokeksu.gamepulse
 
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +24,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
@@ -30,13 +36,25 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lolokeksu.gamepulse.ui.theme.NxiTheme
+
+data class GameApp(
+    val label: String,
+    val packageName: String,
+    val isGameCategory: Boolean
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +70,17 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun GamePulseApp() {
+    val context = LocalContext.current
+    val packageManager = context.packageManager
+
+    var games by remember { mutableStateOf<List<GameApp>>(emptyList()) }
+    var selectedGame by remember { mutableStateOf<GameApp?>(null) }
+
+    LaunchedEffect(Unit) {
+        games = loadLaunchableGames(packageManager)
+        selectedGame = games.firstOrNull()
+    }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
@@ -65,7 +94,7 @@ private fun GamePulseApp() {
         ) {
             NxiHeader()
 
-            NxiSessionCard()
+            NxiSessionCard(selectedGame = selectedGame)
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -73,48 +102,73 @@ private fun GamePulseApp() {
             ) {
                 NxiMetricCard(
                     modifier = Modifier.weight(1f),
-                    title = "FPS",
-                    value = "--",
-                    caption = "waiting"
+                    title = "GAMES",
+                    value = games.size.toString(),
+                    caption = "detected"
                 )
 
                 NxiMetricCard(
                     modifier = Modifier.weight(1f),
-                    title = "TEMP",
-                    value = "--°C",
-                    caption = "idle"
+                    title = "MODE",
+                    value = "MVP",
+                    caption = "launcher"
                 )
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                NxiMetricCard(
-                    modifier = Modifier.weight(1f),
-                    title = "HZ",
-                    value = "--",
-                    caption = "display"
-                )
-
-                NxiMetricCard(
-                    modifier = Modifier.weight(1f),
-                    title = "CPU",
-                    value = "--%",
-                    caption = "root later"
-                )
-            }
-
-            NxiModulesCard()
+            NxiGamesCard(
+                games = games,
+                selectedGame = selectedGame,
+                onGameSelected = { selectedGame = it }
+            )
 
             Spacer(modifier = Modifier.weight(1f))
 
             NxiPrimaryButton(
                 text = "Start Analyze",
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = selectedGame != null,
+                onClick = {
+                    selectedGame?.let { game ->
+                        val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName)
+                        if (launchIntent != null) {
+                            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            context.startActivity(launchIntent)
+                        }
+                    }
+                }
             )
         }
     }
+}
+
+private fun loadLaunchableGames(packageManager: PackageManager): List<GameApp> {
+    val launcherIntent = Intent(Intent.ACTION_MAIN, null).apply {
+        addCategory(Intent.CATEGORY_LAUNCHER)
+    }
+
+    val resolvedApps = packageManager.queryIntentActivities(launcherIntent, 0)
+
+    return resolvedApps
+        .mapNotNull { resolveInfo ->
+            val activityInfo = resolveInfo.activityInfo ?: return@mapNotNull null
+            val appInfo = activityInfo.applicationInfo ?: return@mapNotNull null
+            val packageName = activityInfo.packageName
+            val label = resolveInfo.loadLabel(packageManager)?.toString()?.trim().orEmpty()
+
+            if (packageName == "com.lolokeksu.gamepulse" || packageName == "com.lolokeksu.gamepulse.debug") {
+                return@mapNotNull null
+            }
+
+            GameApp(
+                label = label.ifBlank { packageName },
+                packageName = packageName,
+                isGameCategory = appInfo.category == ApplicationInfo.CATEGORY_GAME
+            )
+        }
+        .sortedWith(
+            compareByDescending<GameApp> { it.isGameCategory }
+                .thenBy { it.label.lowercase() }
+        )
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -135,7 +189,7 @@ private fun NxiHeader() {
             Spacer(modifier = Modifier.width(12.dp))
 
             Text(
-                text = "NXI / GAME SESSION CORE",
+                text = "GAME SESSION CORE",
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.labelMedium,
                 fontFamily = FontFamily.Monospace,
@@ -155,7 +209,7 @@ private fun NxiHeader() {
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = "Analyze real gameplay sessions and explain why the game lagged.",
+            text = "Select a game, start analysis and build a real session report.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium
         )
@@ -166,10 +220,10 @@ private fun NxiHeader() {
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            NxiChip("FPS")
-            NxiChip("THERMAL")
-            NxiChip("REFRESH RATE")
-            NxiChip("ROOT METRICS")
+            NxiChip("GAME SCAN")
+            NxiChip("SESSION")
+            NxiChip("REPORT")
+            NxiChip("ROOT LATER")
         }
     }
 }
@@ -199,7 +253,7 @@ private fun NxiTrafficDots() {
 }
 
 @Composable
-private fun NxiSessionCard() {
+private fun NxiSessionCard(selectedGame: GameApp?) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -218,7 +272,7 @@ private fun NxiSessionCard() {
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "No active game session",
+            text = selectedGame?.label ?: "No game selected",
             color = MaterialTheme.colorScheme.onBackground,
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold
@@ -227,7 +281,8 @@ private fun NxiSessionCard() {
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = "Choose a game and start analysis. The first build will focus on session report, temperature, refresh rate and root CPU timeline.",
+            text = selectedGame?.packageName
+                ?: "Choose a game below. First MVP build will launch the game and prepare the session analyzer base.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall
         )
@@ -235,7 +290,6 @@ private fun NxiSessionCard() {
         Spacer(modifier = Modifier.height(14.dp))
 
         LinearProgressIndicator(
-            progress = { 0.0f },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(6.dp)
@@ -284,18 +338,22 @@ private fun NxiMetricCard(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun NxiModulesCard() {
+private fun NxiGamesCard(
+    games: List<GameApp>,
+    selectedGame: GameApp?,
+    onGameSelected: (GameApp) -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .height(300.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(16.dp)
     ) {
         Text(
-            text = "ANALYZER MODULES",
+            text = "INSTALLED GAMES",
             color = MaterialTheme.colorScheme.primary,
             style = MaterialTheme.typography.labelMedium,
             fontFamily = FontFamily.Monospace,
@@ -304,19 +362,91 @@ private fun NxiModulesCard() {
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            NxiChip("Launch")
-            NxiChip("Stutters")
-            NxiChip("Thermal")
-            NxiChip("Battery")
-            NxiChip("Network")
-            NxiChip("Compare")
-            NxiChip("Score")
-            NxiChip("Advisor")
+        if (games.isEmpty()) {
+            Text(
+                text = "No launchable apps detected.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
+        } else {
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(games) { game ->
+                    NxiGameRow(
+                        game = game,
+                        selected = selectedGame?.packageName == game.packageName,
+                        onClick = { onGameSelected(game) }
+                    )
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun NxiGameRow(
+    game: GameApp,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val borderColor = if (selected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.outline
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.background)
+            .clickable(onClick = onClick)
+            .padding(12.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = if (game.isGameCategory) "GAME" else "APP",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            )
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            Text(
+                text = if (selected) "SELECTED" else "TAP TO SELECT",
+                color = borderColor,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = game.label,
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = game.packageName,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace
+        )
     }
 }
 
@@ -341,16 +471,21 @@ private fun NxiChip(text: String) {
 @Composable
 private fun NxiPrimaryButton(
     text: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onClick: () -> Unit
 ) {
     OutlinedButton(
-        onClick = {},
+        onClick = onClick,
+        enabled = enabled,
         modifier = modifier.height(54.dp),
         shape = RoundedCornerShape(18.dp),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
         colors = ButtonDefaults.outlinedButtonColors(
             containerColor = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.primary
+            contentColor = MaterialTheme.colorScheme.primary,
+            disabledContainerColor = MaterialTheme.colorScheme.surface,
+            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
         )
     ) {
         Text(
