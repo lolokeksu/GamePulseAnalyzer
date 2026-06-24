@@ -75,9 +75,18 @@ data class GameSessionReport(
     val durationMs: Long,
     val startBatteryTempC: Float?,
     val endBatteryTempC: Float?,
+    val startBatteryPercent: Int?,
+    val endBatteryPercent: Int?,
     val refreshRateHz: Float?,
     val completedAtMs: Long
-)
+) {
+    val batteryDrainPercent: Int?
+        get() {
+            val start = startBatteryPercent ?: return null
+            val end = endBatteryPercent ?: return null
+            return (start - end).coerceAtLeast(0)
+        }
+}
 
 class MainActivity : ComponentActivity() {
     private val refreshTick = mutableStateOf(0L)
@@ -156,9 +165,9 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
 
                 NxiMetricCard(
                     modifier = Modifier.weight(1f),
-                    title = "LAST",
-                    value = lastReport?.let { formatDurationShort(it.durationMs) } ?: "--",
-                    caption = "session"
+                    title = "DRAIN",
+                    value = lastReport?.batteryDrainPercent?.let { "$it%" } ?: "--",
+                    caption = "last session"
                 )
             }
 
@@ -297,6 +306,7 @@ private fun startGameSession(context: Context, game: GameApp) {
         .putString("package_name", game.packageName)
         .putLong("start_elapsed_ms", SystemClock.elapsedRealtime())
         .putFloat("start_battery_temp_c", readBatteryTemperatureC(context) ?: -1f)
+        .putInt("start_battery_percent", readBatteryPercent(context) ?: -1)
         .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
         .apply()
 
@@ -330,6 +340,8 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         durationMs = durationMs,
         startBatteryTempC = prefs.getFloat("start_battery_temp_c", -1f).takeIf { it >= 0f },
         endBatteryTempC = readBatteryTemperatureC(context),
+        startBatteryPercent = prefs.getInt("start_battery_percent", -1).takeIf { it >= 0 },
+        endBatteryPercent = readBatteryPercent(context),
         refreshRateHz = prefs.getFloat("refresh_rate_hz", -1f).takeIf { it >= 0f },
         completedAtMs = System.currentTimeMillis()
     )
@@ -341,6 +353,8 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         .putLong("last_duration_ms", report.durationMs)
         .putFloat("last_start_battery_temp_c", report.startBatteryTempC ?: -1f)
         .putFloat("last_end_battery_temp_c", report.endBatteryTempC ?: -1f)
+        .putInt("last_start_battery_percent", report.startBatteryPercent ?: -1)
+        .putInt("last_end_battery_percent", report.endBatteryPercent ?: -1)
         .putFloat("last_refresh_rate_hz", report.refreshRateHz ?: -1f)
         .putLong("last_completed_at_ms", report.completedAtMs)
         .apply()
@@ -364,6 +378,8 @@ private fun loadLastReport(context: Context): GameSessionReport? {
         durationMs = durationMs,
         startBatteryTempC = prefs.getFloat("last_start_battery_temp_c", -1f).takeIf { it >= 0f },
         endBatteryTempC = prefs.getFloat("last_end_battery_temp_c", -1f).takeIf { it >= 0f },
+        startBatteryPercent = prefs.getInt("last_start_battery_percent", -1).takeIf { it >= 0 },
+        endBatteryPercent = prefs.getInt("last_end_battery_percent", -1).takeIf { it >= 0 },
         refreshRateHz = prefs.getFloat("last_refresh_rate_hz", -1f).takeIf { it >= 0f },
         completedAtMs = prefs.getLong("last_completed_at_ms", 0L)
     )
@@ -393,6 +409,8 @@ private fun appendReportHistory(
                 .put("durationMs", item.durationMs)
                 .put("startBatteryTempC", item.startBatteryTempC ?: JSONObject.NULL)
                 .put("endBatteryTempC", item.endBatteryTempC ?: JSONObject.NULL)
+                .put("startBatteryPercent", item.startBatteryPercent ?: JSONObject.NULL)
+                .put("endBatteryPercent", item.endBatteryPercent ?: JSONObject.NULL)
                 .put("refreshRateHz", item.refreshRateHz ?: JSONObject.NULL)
                 .put("completedAtMs", item.completedAtMs)
 
@@ -429,6 +447,8 @@ private fun loadReportHistory(context: Context): List<GameSessionReport> {
                         durationMs = durationMs,
                         startBatteryTempC = item.optNullableFloat("startBatteryTempC"),
                         endBatteryTempC = item.optNullableFloat("endBatteryTempC"),
+                        startBatteryPercent = item.optNullableInt("startBatteryPercent"),
+                        endBatteryPercent = item.optNullableInt("endBatteryPercent"),
                         refreshRateHz = item.optNullableFloat("refreshRateHz"),
                         completedAtMs = completedAtMs
                     )
@@ -454,6 +474,19 @@ private fun JSONObject.optNullableFloat(name: String): Float? {
     }
 }
 
+private fun JSONObject.optNullableInt(name: String): Int? {
+    if (!has(name) || isNull(name)) {
+        return null
+    }
+
+    val value = optInt(name, -1)
+
+    return if (value < 0) {
+        null
+    } else {
+        value
+    }
+}
 
 private fun readBatteryTemperatureC(context: Context): Float? {
     val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
@@ -465,6 +498,20 @@ private fun readBatteryTemperatureC(context: Context): Float? {
     }
 
     return rawTemp / 10f
+}
+
+private fun readBatteryPercent(context: Context): Int? {
+    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        ?: return null
+
+    val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+    val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+
+    if (level < 0 || scale <= 0) {
+        return null
+    }
+
+    return ((level * 100f) / scale).roundToInt().coerceIn(0, 100)
 }
 
 private fun readRefreshRateHz(context: Context): Float? {
@@ -566,8 +613,8 @@ private fun NxiHeader() {
         ) {
             NxiChip("GAME SCAN")
             NxiChip("SESSION")
+            NxiChip("BATTERY")
             NxiChip("REPORT")
-            NxiChip("MANUAL ADD")
         }
     }
 }
@@ -649,7 +696,7 @@ private fun NxiSessionCard(
             Spacer(modifier = Modifier.height(10.dp))
 
             Text(
-                text = "Last report: ${formatDurationShort(lastReport.durationMs)}",
+                text = "Last report: ${formatDurationShort(lastReport.durationMs)} / drain ${formatBatteryDrain(lastReport.batteryDrainPercent)}",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace
@@ -940,6 +987,9 @@ private fun NxiReportCard(report: GameSessionReport) {
             NxiReportPill("DURATION", formatDurationLong(report.durationMs))
             NxiReportPill("START TEMP", formatTemp(report.startBatteryTempC))
             NxiReportPill("END TEMP", formatTemp(report.endBatteryTempC))
+            NxiReportPill("START BAT", formatBatteryPercent(report.startBatteryPercent))
+            NxiReportPill("END BAT", formatBatteryPercent(report.endBatteryPercent))
+            NxiReportPill("DRAIN", formatBatteryDrain(report.batteryDrainPercent))
             NxiReportPill("REFRESH", formatHz(report.refreshRateHz))
         }
     }
@@ -1040,7 +1090,7 @@ private fun NxiHistoryRow(report: GameSessionReport) {
         Spacer(modifier = Modifier.height(4.dp))
 
         Text(
-            text = "${formatTemp(report.startBatteryTempC)} → ${formatTemp(report.endBatteryTempC)}  /  ${formatHz(report.refreshRateHz)}",
+            text = "${formatTemp(report.startBatteryTempC)} → ${formatTemp(report.endBatteryTempC)}  /  ${formatBatteryPercent(report.startBatteryPercent)} → ${formatBatteryPercent(report.endBatteryPercent)}  /  drain ${formatBatteryDrain(report.batteryDrainPercent)}",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace
@@ -1154,4 +1204,12 @@ private fun formatTemp(value: Float?): String {
 
 private fun formatHz(value: Float?): String {
     return value?.let { "${it.roundToInt()} Hz" } ?: "--"
+}
+
+private fun formatBatteryPercent(value: Int?): String {
+    return value?.let { "$it%" } ?: "--"
+}
+
+private fun formatBatteryDrain(value: Int?): String {
+    return value?.let { "$it%" } ?: "--"
 }
