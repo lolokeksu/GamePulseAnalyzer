@@ -106,7 +106,9 @@ data class GameSessionReport(
     val startCharging: Boolean? = null,
     val endCharging: Boolean? = null,
     val startPluggedState: String? = null,
-    val endPluggedState: String? = null
+    val endPluggedState: String? = null,
+    val rootSamplerEnabled: Boolean? = null,
+    val rootSamplesJson: String? = null
 ) {
     val batteryDeltaPercent: Int?
         get() {
@@ -689,6 +691,12 @@ private fun startGameSession(
     val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName) ?: return
 
     val rootMetricsEnabled = rootState.metricsEnabled
+    val rootSamplerStarted = if (rootMetricsEnabled) {
+        RootSessionSampler.start()
+    } else {
+        false
+    }
+
     val batteryState = readBatteryState(context)
     val cpuSnapshot = if (rootMetricsEnabled) {
         readCpuFreqSnapshotWithRoot()
@@ -710,6 +718,7 @@ private fun startGameSession(
         .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
         .putBoolean("start_root_available", rootMetricsEnabled)
         .putString("start_cpu_snapshot", cpuSnapshot)
+        .putBoolean("root_sampler_enabled", rootSamplerStarted)
         .putString("active_samples_json", "[]")
         .putLong("active_last_sample_elapsed_ms", 0L)
         .putInt("active_sample_count", 0)
@@ -758,6 +767,13 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
     }
 
     val samplesJson = prefs.getString("active_samples_json", "[]") ?: "[]"
+    val rootSamplerEnabled = prefs.getBoolean("root_sampler_enabled", false)
+    val rootSamplesJson = if (rootSamplerEnabled) {
+        RootSessionSampler.stopAndRead()
+    } else {
+        "[]"
+    }
+
     val endBatteryState = readBatteryState(context)
 
     val report = GameSessionReport(
@@ -778,7 +794,9 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         startCharging = prefs.getBoolean("start_charging", false),
         endCharging = endBatteryState.charging,
         startPluggedState = prefs.getString("start_plugged_state", "UNKNOWN"),
-        endPluggedState = endBatteryState.pluggedState
+        endPluggedState = endBatteryState.pluggedState,
+        rootSamplerEnabled = rootSamplerEnabled,
+        rootSamplesJson = rootSamplesJson
     )
 
     prefs.edit()
@@ -800,6 +818,8 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         .putBoolean("last_end_charging", report.endCharging ?: false)
         .putString("last_start_plugged_state", report.startPluggedState)
         .putString("last_end_plugged_state", report.endPluggedState)
+        .putBoolean("last_root_sampler_enabled", report.rootSamplerEnabled ?: false)
+        .putString("last_root_samples_json", report.rootSamplesJson)
         .putLong("last_completed_at_ms", report.completedAtMs)
         .apply()
 
@@ -836,7 +856,9 @@ private fun loadLastReport(context: Context): GameSessionReport? {
         startCharging = prefs.getBoolean("last_start_charging", false),
         endCharging = prefs.getBoolean("last_end_charging", false),
         startPluggedState = prefs.getString("last_start_plugged_state", "UNKNOWN"),
-        endPluggedState = prefs.getString("last_end_plugged_state", "UNKNOWN")
+        endPluggedState = prefs.getString("last_end_plugged_state", "UNKNOWN"),
+        rootSamplerEnabled = prefs.getBoolean("last_root_sampler_enabled", false),
+        rootSamplesJson = prefs.getString("last_root_samples_json", null)
     )
 }
 
@@ -875,6 +897,8 @@ private fun appendReportHistory(
                 .put("endCharging", item.endCharging ?: JSONObject.NULL)
                 .put("startPluggedState", item.startPluggedState ?: JSONObject.NULL)
                 .put("endPluggedState", item.endPluggedState ?: JSONObject.NULL)
+                .put("rootSamplerEnabled", item.rootSamplerEnabled ?: JSONObject.NULL)
+                .put("rootSamplesJson", item.rootSamplesJson ?: JSONObject.NULL)
                 .put("completedAtMs", item.completedAtMs)
 
             array.put(objectValue)
@@ -921,7 +945,9 @@ private fun loadReportHistory(context: Context): List<GameSessionReport> {
                         startCharging = item.optNullableBoolean("startCharging"),
                         endCharging = item.optNullableBoolean("endCharging"),
                         startPluggedState = item.optNullableString("startPluggedState"),
-                        endPluggedState = item.optNullableString("endPluggedState")
+                        endPluggedState = item.optNullableString("endPluggedState"),
+                        rootSamplerEnabled = item.optNullableBoolean("rootSamplerEnabled"),
+                        rootSamplesJson = item.optNullableString("rootSamplesJson")
                     )
                 )
             }
@@ -1292,6 +1318,74 @@ private fun samplerReliabilityVerdict(report: GameSessionReport): String {
     }
 }
 
+private fun rootSamplerReliability(report: GameSessionReport): SamplerReliability {
+    val samples = parseSamplesJsonArray(report.rootSamplesJson)
+    val captured = samples.length()
+    val expected = ((report.durationMs / 2_000L) + 1L).toInt().coerceAtLeast(1)
+    val missed = (expected - captured).coerceAtLeast(0)
+
+    var lastElapsed: Long? = null
+    var maxGap = 0L
+
+    for (index in 0 until samples.length()) {
+        val item = samples.optJSONObject(index) ?: continue
+        val elapsed = item.optLong("elapsedMs", -1L)
+
+        if (elapsed < 0L) {
+            continue
+        }
+
+        val previous = lastElapsed
+        if (previous != null) {
+            maxGap = maxGap.coerceAtLeast(elapsed - previous)
+        }
+
+        lastElapsed = elapsed
+    }
+
+    val reliability = if (expected <= 0) {
+        0f
+    } else {
+        ((captured * 100f) / expected).coerceIn(0f, 100f)
+    }
+
+    return SamplerReliability(
+        expectedSamples = expected,
+        capturedSamples = captured,
+        missedSamples = missed,
+        reliabilityPercent = reliability,
+        maxGapMs = maxGap
+    )
+}
+
+private fun rootSamplerReliabilityVerdict(report: GameSessionReport): String {
+    if (report.rootSamplerEnabled != true) {
+        return "DISABLED"
+    }
+
+    val reliability = rootSamplerReliability(report).reliabilityPercent
+
+    return when {
+        reliability >= 80f -> "GOOD"
+        reliability >= 40f -> "PARTIAL"
+        else -> "POOR"
+    }
+}
+
+private fun rootSamplerWarning(report: GameSessionReport): String? {
+    if (report.rootSamplerEnabled != true) {
+        return "Root-backed sampler disabled. Enable ROOT tab diagnostics before session."
+    }
+
+    val reliability = rootSamplerReliability(report)
+
+    if (reliability.reliabilityPercent >= 80f) {
+        return null
+    }
+
+    return "Root sampler captured ${reliability.capturedSamples} of expected ~${reliability.expectedSamples} samples. Reliability ${formatRate(reliability.reliabilityPercent)}%, max gap ${formatDurationLong(reliability.maxGapMs)}."
+}
+
 private fun refreshAnalysis(report: GameSessionReport): RefreshAnalysis {
     val samples = parseSamplesJsonArray(report.samplesJson)
     val values = mutableListOf<Float>()
@@ -1464,7 +1558,11 @@ private fun buildSessionVerdict(report: GameSessionReport): String {
     }
 
     if (samplerReliabilityVerdict(report) == "POOR") {
-        issues.add("sampler reliability is poor")
+        if (report.rootSamplerEnabled == true && rootSamplerReliabilityVerdict(report) != "POOR") {
+            issues.add("Android sampler poor, root sampler available")
+        } else {
+            issues.add("sampler reliability is poor")
+        }
     }
 
     if (report.endRootAvailable == false) {
@@ -1580,6 +1678,18 @@ private fun buildTextReport(report: GameSessionReport): String {
         samplerWarning(report)?.let { appendLine("- Warning: $it") }
         appendLine("- Interval: 2s")
         appendLine()
+
+        val rootReliability = rootSamplerReliability(report)
+        appendLine("Root-backed sampler:")
+        appendLine("- Enabled: ${formatBoolean(report.rootSamplerEnabled)}")
+        appendLine("- Samples count: ${rootReliability.capturedSamples}")
+        appendLine("- Expected samples: ~${rootReliability.expectedSamples}")
+        appendLine("- Missed samples: ${rootReliability.missedSamples}")
+        appendLine("- Reliability: ${formatRate(rootReliability.reliabilityPercent)}%")
+        appendLine("- Max sample gap: ${formatDurationLong(rootReliability.maxGapMs)}")
+        appendLine("- Verdict: ${rootSamplerReliabilityVerdict(report)}")
+        rootSamplerWarning(report)?.let { appendLine("- Warning: $it") }
+        appendLine()
         appendLine("Start CPU snapshot:")
         appendLine(report.startCpuSnapshot ?: "--")
         appendLine()
@@ -1632,6 +1742,15 @@ private fun buildJsonReport(report: GameSessionReport): JSONObject {
         .put("samplerVerdict", samplerReliabilityVerdict(report))
         .put("samplerWarning", samplerWarning(report) ?: JSONObject.NULL)
         .put("samples", parseSamplesJsonArray(report.samplesJson))
+        .put("rootSamplerEnabled", report.rootSamplerEnabled ?: false)
+        .put("rootSamplesCount", rootSamplerReliability(report).capturedSamples)
+        .put("rootSamplesExpected", rootSamplerReliability(report).expectedSamples)
+        .put("rootSamplesMissed", rootSamplerReliability(report).missedSamples)
+        .put("rootSamplerReliabilityPercent", rootSamplerReliability(report).reliabilityPercent)
+        .put("rootSamplerMaxGapMs", rootSamplerReliability(report).maxGapMs)
+        .put("rootSamplerVerdict", rootSamplerReliabilityVerdict(report))
+        .put("rootSamplerWarning", rootSamplerWarning(report) ?: JSONObject.NULL)
+        .put("rootSamples", parseSamplesJsonArray(report.rootSamplesJson))
         .put("sessionVerdict", buildSessionVerdict(report))
         .put("completedAtMs", report.completedAtMs)
 }
@@ -2210,6 +2329,7 @@ private fun NxiReportCard(
             NxiReportPill("ESTIMATE", formatEstimatedFullBattery(report))
             NxiReportPill("REFRESH", "${formatHz(refreshAnalysis(report).dominantHz)} / ${refreshVerdict(report)}")
             NxiReportPill("SAMPLER", "${samplerReliabilityVerdict(report)} / ${formatRate(samplerReliability(report).reliabilityPercent)}%")
+            NxiReportPill("ROOT SAMPLER", "${rootSamplerReliabilityVerdict(report)} / ${formatRate(rootSamplerReliability(report).reliabilityPercent)}%")
             NxiReportPill("ROOT", formatRootState(report.endRootAvailable))
         }
 
@@ -2221,6 +2341,14 @@ private fun NxiReportCard(
             Spacer(modifier = Modifier.height(12.dp))
             NxiCodeBlock(
                 title = "SAMPLER WARNING",
+                value = warning
+            )
+        }
+
+        rootSamplerWarning(report)?.let { warning ->
+            Spacer(modifier = Modifier.height(12.dp))
+            NxiCodeBlock(
+                title = "ROOT SAMPLER",
                 value = warning
             )
         }
@@ -2422,7 +2550,7 @@ private fun NxiHistoryRow(report: GameSessionReport) {
         Spacer(modifier = Modifier.height(4.dp))
 
         Text(
-            text = "${thermalVerdict(report)} / ${formatBatteryCost(report)} / ${formatHz(refreshAnalysis(report).dominantHz)} / ${samplerReliabilityVerdict(report)}",
+            text = "${thermalVerdict(report)} / ${formatBatteryCost(report)} / ${formatHz(refreshAnalysis(report).dominantHz)} / ${samplerReliabilityVerdict(report)} / root ${rootSamplerReliabilityVerdict(report)}",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace
