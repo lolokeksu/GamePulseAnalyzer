@@ -78,6 +78,16 @@ data class GameApp(
     val isManual: Boolean
 )
 
+data class RootDiagnosticsState(
+    val checked: Boolean,
+    val suBinaryFound: Boolean,
+    val suExecutionAllowed: Boolean,
+    val cpuPoliciesReadable: Boolean,
+    val thermalZonesReadable: Boolean,
+    val metricsEnabled: Boolean,
+    val statusMessage: String
+)
+
 data class GameSessionReport(
     val gameLabel: String,
     val packageName: String,
@@ -129,6 +139,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
     var selectedGame by remember { mutableStateOf<GameApp?>(null) }
     var lastReport by remember { mutableStateOf<GameSessionReport?>(null) }
     var reportHistory by remember { mutableStateOf<List<GameSessionReport>>(emptyList()) }
+    var rootState by remember { mutableStateOf(loadRootDiagnosticsState(context)) }
     var manualPackageInput by remember { mutableStateOf("") }
     var manualStatus by remember { mutableStateOf<String?>(null) }
     var exportStatus by remember { mutableStateOf<String?>(null) }
@@ -138,6 +149,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
         selectedGame = games.firstOrNull()
         lastReport = loadLastReport(context)
         reportHistory = loadReportHistory(context)
+        rootState = loadRootDiagnosticsState(context)
     }
 
     LaunchedEffect(refreshTick.value) {
@@ -146,6 +158,8 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
             reportHistory = loadReportHistory(context)
             exportStatus = null
         }
+
+        rootState = loadRootDiagnosticsState(context)
     }
 
     Surface(
@@ -164,7 +178,8 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
 
             NxiSessionCard(
                 selectedGame = selectedGame,
-                lastReport = lastReport
+                lastReport = lastReport,
+                rootState = rootState
             )
 
             Row(
@@ -180,11 +195,32 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
 
                 NxiMetricCard(
                     modifier = Modifier.weight(1f),
-                    title = "COST",
-                    value = lastReport?.let { formatBatteryCost(it) } ?: "--",
-                    caption = "battery/min"
+                    title = "ROOT",
+                    value = if (rootState.metricsEnabled) "ON" else "OFF",
+                    caption = if (rootState.checked) rootState.statusMessage else "not checked"
                 )
             }
+
+            NxiRootDiagnosticsCard(
+                state = rootState,
+                onCheckRoot = {
+                    rootState = runRootDiagnostics(context)
+                },
+                onDisableRoot = {
+                    rootState = saveRootDiagnosticsState(
+                        context = context,
+                        state = RootDiagnosticsState(
+                            checked = false,
+                            suBinaryFound = false,
+                            suExecutionAllowed = false,
+                            cpuPoliciesReadable = false,
+                            thermalZonesReadable = false,
+                            metricsEnabled = false,
+                            statusMessage = "Root metrics disabled"
+                        )
+                    )
+                }
+            )
 
             NxiManualGameCard(
                 packageInput = manualPackageInput,
@@ -246,7 +282,11 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
                 enabled = selectedGame != null,
                 onClick = {
                     selectedGame?.let { game ->
-                        startGameSession(context, game)
+                        startGameSession(
+                            context = context,
+                            game = game,
+                            rootState = rootState
+                        )
                     }
                 }
             )
@@ -331,12 +371,16 @@ private fun loadManualGames(
     }
 }
 
-private fun startGameSession(context: Context, game: GameApp) {
+private fun startGameSession(
+    context: Context,
+    game: GameApp,
+    rootState: RootDiagnosticsState
+) {
     val packageManager = context.packageManager
     val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName) ?: return
 
-    val rootAvailable = isRootAvailable()
-    val cpuSnapshot = if (rootAvailable) {
+    val rootMetricsEnabled = rootState.metricsEnabled
+    val cpuSnapshot = if (rootMetricsEnabled) {
         readCpuFreqSnapshotWithRoot()
     } else {
         null
@@ -352,7 +396,7 @@ private fun startGameSession(context: Context, game: GameApp) {
         .putFloat("start_battery_temp_c", readBatteryTemperatureC(context) ?: -1f)
         .putInt("start_battery_percent", readBatteryPercent(context) ?: -1)
         .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
-        .putBoolean("start_root_available", rootAvailable)
+        .putBoolean("start_root_available", rootMetricsEnabled)
         .putString("start_cpu_snapshot", cpuSnapshot)
         .apply()
 
@@ -380,8 +424,9 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         return null
     }
 
-    val endRootAvailable = isRootAvailable()
-    val endCpuSnapshot = if (endRootAvailable) {
+    val rootState = loadRootDiagnosticsState(context)
+    val rootMetricsEnabled = rootState.metricsEnabled
+    val endCpuSnapshot = if (rootMetricsEnabled) {
         readCpuFreqSnapshotWithRoot()
     } else {
         null
@@ -397,7 +442,7 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         endBatteryPercent = readBatteryPercent(context),
         refreshRateHz = prefs.getFloat("refresh_rate_hz", -1f).takeIf { it >= 0f },
         startRootAvailable = prefs.getBoolean("start_root_available", false),
-        endRootAvailable = endRootAvailable,
+        endRootAvailable = rootMetricsEnabled,
         startCpuSnapshot = prefs.getString("start_cpu_snapshot", null),
         endCpuSnapshot = endCpuSnapshot,
         completedAtMs = System.currentTimeMillis()
@@ -533,6 +578,105 @@ private fun loadReportHistory(context: Context): List<GameSessionReport> {
     }
 }
 
+private fun loadRootDiagnosticsState(context: Context): RootDiagnosticsState {
+    val prefs = context.getSharedPreferences("gamepulse_root", Context.MODE_PRIVATE)
+
+    return RootDiagnosticsState(
+        checked = prefs.getBoolean("checked", false),
+        suBinaryFound = prefs.getBoolean("su_binary_found", false),
+        suExecutionAllowed = prefs.getBoolean("su_execution_allowed", false),
+        cpuPoliciesReadable = prefs.getBoolean("cpu_policies_readable", false),
+        thermalZonesReadable = prefs.getBoolean("thermal_zones_readable", false),
+        metricsEnabled = prefs.getBoolean("metrics_enabled", false),
+        statusMessage = prefs.getString("status_message", "Not checked") ?: "Not checked"
+    )
+}
+
+private fun saveRootDiagnosticsState(
+    context: Context,
+    state: RootDiagnosticsState
+): RootDiagnosticsState {
+    val prefs = context.getSharedPreferences("gamepulse_root", Context.MODE_PRIVATE)
+
+    prefs.edit()
+        .putBoolean("checked", state.checked)
+        .putBoolean("su_binary_found", state.suBinaryFound)
+        .putBoolean("su_execution_allowed", state.suExecutionAllowed)
+        .putBoolean("cpu_policies_readable", state.cpuPoliciesReadable)
+        .putBoolean("thermal_zones_readable", state.thermalZonesReadable)
+        .putBoolean("metrics_enabled", state.metricsEnabled)
+        .putString("status_message", state.statusMessage)
+        .apply()
+
+    return state
+}
+
+private fun runRootDiagnostics(context: Context): RootDiagnosticsState {
+    val suBinaryFound = isSuBinaryFound()
+    val suOutput = runRootCommand("echo gamepulse_root_ok", 4_000L)
+    val suExecutionAllowed = suOutput?.contains("gamepulse_root_ok") == true
+
+    val cpuPoliciesReadable = if (suExecutionAllowed) {
+        runRootCommand(
+            command = "test -r /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq && echo cpu_ok || echo cpu_blocked",
+            timeoutMs = 2_000L
+        )?.contains("cpu_ok") == true
+    } else {
+        false
+    }
+
+    val thermalZonesReadable = if (suExecutionAllowed) {
+        runRootCommand(
+            command = "ls /sys/class/thermal/thermal_zone* >/dev/null 2>&1 && echo thermal_ok || echo thermal_blocked",
+            timeoutMs = 2_000L
+        )?.contains("thermal_ok") == true
+    } else {
+        false
+    }
+
+    val metricsEnabled = suExecutionAllowed && cpuPoliciesReadable
+
+    val statusMessage = when {
+        !suBinaryFound -> "su binary not found"
+        !suExecutionAllowed -> "root denied or timeout"
+        !cpuPoliciesReadable -> "root ok, CPU policies blocked"
+        metricsEnabled -> "root metrics ready"
+        else -> "root checked"
+    }
+
+    return saveRootDiagnosticsState(
+        context = context,
+        state = RootDiagnosticsState(
+            checked = true,
+            suBinaryFound = suBinaryFound,
+            suExecutionAllowed = suExecutionAllowed,
+            cpuPoliciesReadable = cpuPoliciesReadable,
+            thermalZonesReadable = thermalZonesReadable,
+            metricsEnabled = metricsEnabled,
+            statusMessage = statusMessage
+        )
+    )
+}
+
+private fun isSuBinaryFound(): Boolean {
+    return try {
+        val process = ProcessBuilder("sh", "-c", "command -v su || which su || ls /system/bin/su /system/xbin/su 2>/dev/null")
+            .redirectErrorStream(true)
+            .start()
+
+        val finished = process.waitFor(1_500L, TimeUnit.MILLISECONDS)
+
+        if (!finished) {
+            process.destroyForcibly()
+            return false
+        }
+
+        process.inputStream.bufferedReader().use { it.readText() }.trim().isNotBlank()
+    } catch (_: Exception) {
+        false
+    }
+}
+
 private fun JSONObject.optNullableFloat(name: String): Float? {
     if (!has(name) || isNull(name)) {
         return null
@@ -649,11 +793,6 @@ private fun loadLaunchableGames(
                 .thenByDescending { it.isManual }
                 .thenBy { it.label.lowercase() }
         )
-}
-
-private fun isRootAvailable(): Boolean {
-    val output = runRootCommand("echo gamepulse_root_ok", 1_500L)
-    return output?.contains("gamepulse_root_ok") == true
 }
 
 private fun readCpuFreqSnapshotWithRoot(): String? {
@@ -778,13 +917,13 @@ private fun buildSessionVerdict(report: GameSessionReport): String {
     }
 
     if (report.endRootAvailable == false) {
-        issues.add("root metrics unavailable")
+        issues.add("root metrics disabled")
     }
 
     return if (issues.isEmpty()) {
         "Stable basic session. No strong thermal, battery, or refresh issue detected in this MVP report."
     } else {
-        "Detected: ${issues.joinToString(", ")}. Check temperature, battery cost, refresh rate and root CPU snapshot."
+        "Detected: ${issues.joinToString(", ")}. Root metrics are collected only after explicit Check Root."
     }
 }
 
@@ -861,8 +1000,9 @@ private fun buildTextReport(report: GameSessionReport): String {
         appendLine("- Verdict: ${refreshVerdict(report)}")
         appendLine()
         appendLine("Root:")
-        appendLine("- Start root: ${formatRootState(report.startRootAvailable)}")
-        appendLine("- End root: ${formatRootState(report.endRootAvailable)}")
+        appendLine("- Start root metrics: ${formatRootState(report.startRootAvailable)}")
+        appendLine("- End root metrics: ${formatRootState(report.endRootAvailable)}")
+        appendLine("- Note: root metrics are used only after explicit Check Root in the app.")
         appendLine()
         appendLine("Start CPU snapshot:")
         appendLine(report.startCpuSnapshot ?: "--")
@@ -897,6 +1037,7 @@ private fun buildJsonReport(report: GameSessionReport): JSONObject {
         .put("endRootAvailable", report.endRootAvailable ?: JSONObject.NULL)
         .put("startCpuSnapshot", report.startCpuSnapshot ?: JSONObject.NULL)
         .put("endCpuSnapshot", report.endCpuSnapshot ?: JSONObject.NULL)
+        .put("rootNote", "Root metrics are used only after explicit Check Root in the app.")
         .put("sessionVerdict", buildSessionVerdict(report))
         .put("completedAtMs", report.completedAtMs)
 }
@@ -1000,7 +1141,8 @@ private fun NxiTrafficDots() {
 @Composable
 private fun NxiSessionCard(
     selectedGame: GameApp?,
-    lastReport: GameSessionReport?
+    lastReport: GameSessionReport?,
+    rootState: RootDiagnosticsState
 ) {
     Column(
         modifier = Modifier
@@ -1044,6 +1186,19 @@ private fun NxiSessionCard(
                 .clip(RoundedCornerShape(99.dp)),
             color = MaterialTheme.colorScheme.primary,
             trackColor = MaterialTheme.colorScheme.outline
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Text(
+            text = if (rootState.metricsEnabled) {
+                "Root metrics: enabled"
+            } else {
+                "Root metrics: disabled, use Check Root manually"
+            },
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace
         )
 
         if (lastReport != null) {
@@ -1094,6 +1249,81 @@ private fun NxiMetricCard(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall
         )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun NxiRootDiagnosticsCard(
+    state: RootDiagnosticsState,
+    onCheckRoot: () -> Unit,
+    onDisableRoot: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "ROOT DIAGNOSTICS",
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Text(
+            text = "Root is never requested during normal session start. Use Check Root explicitly to enable CPU metrics.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            NxiReportPill("STATUS", if (state.metricsEnabled) "READY" else if (state.checked) "BLOCKED" else "NOT CHECKED")
+            NxiReportPill("SU", if (state.suBinaryFound) "FOUND" else "--")
+            NxiReportPill("EXEC", if (state.suExecutionAllowed) "ALLOWED" else "--")
+            NxiReportPill("CPU", if (state.cpuPoliciesReadable) "READABLE" else "--")
+            NxiReportPill("THERMAL", if (state.thermalZonesReadable) "READABLE" else "--")
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = state.statusMessage,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            NxiPrimaryButton(
+                text = "Check Root",
+                modifier = Modifier.weight(1f),
+                enabled = true,
+                onClick = onCheckRoot
+            )
+
+            NxiPrimaryButton(
+                text = "Disable",
+                modifier = Modifier.weight(1f),
+                enabled = state.checked || state.metricsEnabled,
+                onClick = onDisableRoot
+            )
+        }
     }
 }
 
@@ -1712,8 +1942,8 @@ private fun formatRate(value: Float): String {
 
 private fun formatRootState(value: Boolean?): String {
     return when (value) {
-        true -> "available"
-        false -> "blocked"
+        true -> "enabled"
+        false -> "disabled"
         null -> "--"
     }
 }
