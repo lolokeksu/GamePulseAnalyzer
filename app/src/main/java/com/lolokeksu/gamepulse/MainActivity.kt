@@ -101,7 +101,8 @@ data class GameSessionReport(
     val endRootAvailable: Boolean?,
     val startCpuSnapshot: String?,
     val endCpuSnapshot: String?,
-    val completedAtMs: Long
+    val completedAtMs: Long,
+    val samplesJson: String? = null
 ) {
     val batteryDrainPercent: Int?
         get() {
@@ -656,7 +657,20 @@ private fun startGameSession(
         .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
         .putBoolean("start_root_available", rootMetricsEnabled)
         .putString("start_cpu_snapshot", cpuSnapshot)
+        .putString("active_samples_json", "[]")
+        .putLong("active_last_sample_elapsed_ms", 0L)
+        .putInt("active_sample_count", 0)
         .apply()
+
+    val samplerIntent = Intent(context, GamePulseSessionService::class.java).apply {
+        putExtra(GamePulseSessionService.EXTRA_ROOT_METRICS_ENABLED, rootMetricsEnabled)
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.startForegroundService(samplerIntent)
+    } else {
+        context.startService(samplerIntent)
+    }
 
     launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     context.startActivity(launchIntent)
@@ -690,6 +704,8 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         null
     }
 
+    val samplesJson = prefs.getString("active_samples_json", "[]") ?: "[]"
+
     val report = GameSessionReport(
         gameLabel = prefs.getString("game_label", "Unknown game") ?: "Unknown game",
         packageName = prefs.getString("package_name", "unknown.package") ?: "unknown.package",
@@ -703,7 +719,8 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         endRootAvailable = rootMetricsEnabled,
         startCpuSnapshot = prefs.getString("start_cpu_snapshot", null),
         endCpuSnapshot = endCpuSnapshot,
-        completedAtMs = System.currentTimeMillis()
+        completedAtMs = System.currentTimeMillis(),
+        samplesJson = samplesJson
     )
 
     prefs.edit()
@@ -720,10 +737,13 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         .putBoolean("last_end_root_available", report.endRootAvailable ?: false)
         .putString("last_start_cpu_snapshot", report.startCpuSnapshot)
         .putString("last_end_cpu_snapshot", report.endCpuSnapshot)
+        .putString("last_samples_json", report.samplesJson)
         .putLong("last_completed_at_ms", report.completedAtMs)
         .apply()
 
     appendReportHistory(context, report)
+
+    context.stopService(Intent(context, GamePulseSessionService::class.java))
 
     return report
 }
@@ -749,7 +769,8 @@ private fun loadLastReport(context: Context): GameSessionReport? {
         endRootAvailable = prefs.getBoolean("last_end_root_available", false),
         startCpuSnapshot = prefs.getString("last_start_cpu_snapshot", null),
         endCpuSnapshot = prefs.getString("last_end_cpu_snapshot", null),
-        completedAtMs = prefs.getLong("last_completed_at_ms", 0L)
+        completedAtMs = prefs.getLong("last_completed_at_ms", 0L),
+        samplesJson = prefs.getString("last_samples_json", null)
     )
 }
 
@@ -1262,6 +1283,10 @@ private fun buildTextReport(report: GameSessionReport): String {
         appendLine("- End root metrics: ${formatRootState(report.endRootAvailable)}")
         appendLine("- Note: root metrics are used only after explicit Check Root in the app.")
         appendLine()
+        appendLine("Sampler:")
+        appendLine("- Samples count: ${parseSamplesJsonArray(report.samplesJson).length()}")
+        appendLine("- Interval: 2s")
+        appendLine()
         appendLine("Start CPU snapshot:")
         appendLine(report.startCpuSnapshot ?: "--")
         appendLine()
@@ -1296,8 +1321,23 @@ private fun buildJsonReport(report: GameSessionReport): JSONObject {
         .put("startCpuSnapshot", report.startCpuSnapshot ?: JSONObject.NULL)
         .put("endCpuSnapshot", report.endCpuSnapshot ?: JSONObject.NULL)
         .put("rootNote", "Root metrics are used only after explicit Check Root in the app.")
+        .put("samplesIntervalMs", 2000)
+        .put("samplesCount", parseSamplesJsonArray(report.samplesJson).length())
+        .put("samples", parseSamplesJsonArray(report.samplesJson))
         .put("sessionVerdict", buildSessionVerdict(report))
         .put("completedAtMs", report.completedAtMs)
+}
+
+private fun parseSamplesJsonArray(raw: String?): JSONArray {
+    if (raw.isNullOrBlank()) {
+        return JSONArray()
+    }
+
+    return try {
+        JSONArray(raw)
+    } catch (_: Exception) {
+        JSONArray()
+    }
 }
 
 private fun sanitizeFileName(value: String): String {
