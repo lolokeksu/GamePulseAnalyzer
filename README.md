@@ -2,7 +2,7 @@
 
 GamePulse Analyzer is an Android gaming session analyzer built with Kotlin and Jetpack Compose in NXI style.
 
-The app is designed to analyze real gameplay sessions and explain why a game lagged: thermal throttling, refresh rate drops, unstable FPS, CPU/GPU frequency drops, battery drain, refresh rate mismatch, or network issues.
+The app analyzes real gameplay sessions and explains why a game lagged: thermal throttling, refresh rate drops, unstable FPS, CPU/GPU frequency drops, battery drain, refresh rate mismatch, or network issues.
 
 ## Core concept
 
