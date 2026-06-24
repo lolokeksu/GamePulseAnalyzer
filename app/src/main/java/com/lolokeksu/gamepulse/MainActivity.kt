@@ -143,6 +143,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
     var manualPackageInput by remember { mutableStateOf("") }
     var manualStatus by remember { mutableStateOf<String?>(null) }
     var exportStatus by remember { mutableStateOf<String?>(null) }
+    var currentTab by remember { mutableStateOf(GamePulseTab.DASHBOARD) }
 
     LaunchedEffect(Unit) {
         games = loadLaunchableGames(context, packageManager)
@@ -176,123 +177,380 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
         ) {
             NxiHeader()
 
-            NxiSessionCard(
-                selectedGame = selectedGame,
-                lastReport = lastReport,
-                rootState = rootState
+            NxiTabBar(
+                currentTab = currentTab,
+                onTabSelected = { currentTab = it }
             )
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                NxiMetricCard(
-                    modifier = Modifier.weight(1f),
-                    title = "GAMES",
-                    value = games.size.toString(),
-                    caption = "detected"
-                )
-
-                NxiMetricCard(
-                    modifier = Modifier.weight(1f),
-                    title = "ROOT",
-                    value = if (rootState.metricsEnabled) "ON" else "OFF",
-                    caption = if (rootState.checked) rootState.statusMessage else "not checked"
-                )
-            }
-
-            NxiRootDiagnosticsCard(
-                state = rootState,
-                onCheckRoot = {
-                    rootState = runRootDiagnostics(context)
-                },
-                onDisableRoot = {
-                    rootState = saveRootDiagnosticsState(
-                        context = context,
-                        state = RootDiagnosticsState(
-                            checked = false,
-                            suBinaryFound = false,
-                            suExecutionAllowed = false,
-                            cpuPoliciesReadable = false,
-                            thermalZonesReadable = false,
-                            metricsEnabled = false,
-                            statusMessage = "Root metrics disabled"
-                        )
+            when (currentTab) {
+                GamePulseTab.DASHBOARD -> {
+                    NxiDashboardWorkspace(
+                        gamesCount = games.size,
+                        reportsCount = reportHistory.size,
+                        selectedGame = selectedGame,
+                        lastReport = lastReport,
+                        rootState = rootState,
+                        onStartAnalyze = {
+                            selectedGame?.let { game ->
+                                startGameSession(
+                                    context = context,
+                                    game = game,
+                                    rootState = rootState
+                                )
+                            }
+                        }
                     )
                 }
-            )
 
-            NxiManualGameCard(
-                packageInput = manualPackageInput,
-                status = manualStatus,
-                onPackageInputChanged = {
-                    manualPackageInput = it
-                    manualStatus = null
-                },
-                onAddClicked = {
-                    val addedGame = addManualGame(
-                        context = context,
-                        packageManager = packageManager,
-                        rawPackageName = manualPackageInput
+                GamePulseTab.GAMES -> {
+                    NxiGamesWorkspace(
+                        games = games,
+                        selectedGame = selectedGame,
+                        packageInput = manualPackageInput,
+                        manualStatus = manualStatus,
+                        onGameSelected = { selectedGame = it },
+                        onPackageInputChanged = {
+                            manualPackageInput = it
+                            manualStatus = null
+                        },
+                        onAddClicked = {
+                            val addedGame = addManualGame(
+                                context = context,
+                                packageManager = packageManager,
+                                rawPackageName = manualPackageInput
+                            )
+
+                            if (addedGame == null) {
+                                manualStatus = "Package not found or app has no launcher activity."
+                            } else {
+                                games = loadLaunchableGames(context, packageManager)
+                                selectedGame = games.firstOrNull { it.packageName == addedGame.packageName }
+                                manualPackageInput = ""
+                                manualStatus = "Added: ${addedGame.label}"
+                            }
+                        }
                     )
-
-                    if (addedGame == null) {
-                        manualStatus = "Package not found or app has no launcher activity."
-                    } else {
-                        games = loadLaunchableGames(context, packageManager)
-                        selectedGame = games.firstOrNull { it.packageName == addedGame.packageName }
-                        manualPackageInput = ""
-                        manualStatus = "Added: ${addedGame.label}"
-                    }
                 }
-            )
 
-            NxiGamesCard(
-                games = games,
-                selectedGame = selectedGame,
-                onGameSelected = { selectedGame = it }
-            )
+                GamePulseTab.REPORTS -> {
+                    NxiReportsWorkspace(
+                        lastReport = lastReport,
+                        history = reportHistory,
+                        exportStatus = exportStatus,
+                        onExportTxt = {
+                            lastReport?.let { report ->
+                                exportStatus = exportReport(
+                                    context = context,
+                                    report = report,
+                                    format = ExportFormat.TXT
+                                )
+                            }
+                        },
+                        onExportJson = {
+                            lastReport?.let { report ->
+                                exportStatus = exportReport(
+                                    context = context,
+                                    report = report,
+                                    format = ExportFormat.JSON
+                                )
+                            }
+                        }
+                    )
+                }
 
-            lastReport?.let { report ->
-                NxiReportCard(
-                    report = report,
-                    exportStatus = exportStatus,
-                    onExportTxt = {
-                        exportStatus = exportReport(
-                            context = context,
-                            report = report,
-                            format = ExportFormat.TXT
-                        )
-                    },
-                    onExportJson = {
-                        exportStatus = exportReport(
-                            context = context,
-                            report = report,
-                            format = ExportFormat.JSON
-                        )
-                    }
-                )
+                GamePulseTab.ROOT -> {
+                    NxiRootWorkspace(
+                        rootState = rootState,
+                        onCheckRoot = {
+                            rootState = runRootDiagnostics(context)
+                        },
+                        onDisableRoot = {
+                            rootState = saveRootDiagnosticsState(
+                                context = context,
+                                state = RootDiagnosticsState(
+                                    checked = false,
+                                    suBinaryFound = false,
+                                    suExecutionAllowed = false,
+                                    cpuPoliciesReadable = false,
+                                    thermalZonesReadable = false,
+                                    metricsEnabled = false,
+                                    statusMessage = "Root metrics disabled"
+                                )
+                            )
+                        }
+                    )
+                }
             }
-
-            NxiHistoryCard(history = reportHistory)
-
-            NxiPrimaryButton(
-                text = "Start Analyze",
-                modifier = Modifier.fillMaxWidth(),
-                enabled = selectedGame != null,
-                onClick = {
-                    selectedGame?.let { game ->
-                        startGameSession(
-                            context = context,
-                            game = game,
-                            rootState = rootState
-                        )
-                    }
-                }
-            )
 
             Spacer(modifier = Modifier.height(8.dp))
         }
+    }
+}
+
+private enum class GamePulseTab(val title: String) {
+    DASHBOARD("HOME"),
+    GAMES("GAMES"),
+    REPORTS("REPORTS"),
+    ROOT("ROOT")
+}
+
+@Composable
+private fun NxiTabBar(
+    currentTab: GamePulseTab,
+    onTabSelected: (GamePulseTab) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        GamePulseTab.values().forEach { tab ->
+            NxiTabButton(
+                modifier = Modifier.weight(1f),
+                text = tab.title,
+                selected = currentTab == tab,
+                onClick = { onTabSelected(tab) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun NxiTabButton(
+    modifier: Modifier,
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val backgroundColor = if (selected) {
+        MaterialTheme.colorScheme.surface
+    } else {
+        MaterialTheme.colorScheme.background
+    }
+
+    val borderColor = if (selected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.outline
+    }
+
+    val textColor = if (selected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Box(
+        modifier = modifier
+            .height(42.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(backgroundColor)
+            .border(
+                width = 1.dp,
+                color = borderColor,
+                shape = RoundedCornerShape(16.dp)
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = textColor,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+private fun NxiDashboardWorkspace(
+    gamesCount: Int,
+    reportsCount: Int,
+    selectedGame: GameApp?,
+    lastReport: GameSessionReport?,
+    rootState: RootDiagnosticsState,
+    onStartAnalyze: () -> Unit
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        NxiSessionCard(
+            selectedGame = selectedGame,
+            lastReport = lastReport,
+            rootState = rootState
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            NxiMetricCard(
+                modifier = Modifier.weight(1f),
+                title = "GAMES",
+                value = gamesCount.toString(),
+                caption = "detected"
+            )
+
+            NxiMetricCard(
+                modifier = Modifier.weight(1f),
+                title = "ROOT",
+                value = if (rootState.metricsEnabled) "ON" else "OFF",
+                caption = if (rootState.checked) rootState.statusMessage else "not checked"
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            NxiMetricCard(
+                modifier = Modifier.weight(1f),
+                title = "REPORTS",
+                value = reportsCount.toString(),
+                caption = "saved"
+            )
+
+            NxiMetricCard(
+                modifier = Modifier.weight(1f),
+                title = "COST",
+                value = lastReport?.let { formatBatteryCost(it) } ?: "--",
+                caption = "battery/min"
+            )
+        }
+
+        if (lastReport != null) {
+            NxiVerdictBlock(text = buildSessionVerdict(lastReport))
+        } else {
+            NxiWorkspaceNotice(
+                title = "NO SESSION YET",
+                text = "Select a game in GAMES tab, then return here and press Start Analyze."
+            )
+        }
+
+        NxiPrimaryButton(
+            text = "Start Analyze",
+            modifier = Modifier.fillMaxWidth(),
+            enabled = selectedGame != null,
+            onClick = onStartAnalyze
+        )
+    }
+}
+
+@Composable
+private fun NxiGamesWorkspace(
+    games: List<GameApp>,
+    selectedGame: GameApp?,
+    packageInput: String,
+    manualStatus: String?,
+    onGameSelected: (GameApp) -> Unit,
+    onPackageInputChanged: (String) -> Unit,
+    onAddClicked: () -> Unit
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        NxiWorkspaceNotice(
+            title = "GAME LIBRARY",
+            text = "Choose detected games or add missing games manually by package name."
+        )
+
+        NxiManualGameCard(
+            packageInput = packageInput,
+            status = manualStatus,
+            onPackageInputChanged = onPackageInputChanged,
+            onAddClicked = onAddClicked
+        )
+
+        NxiGamesCard(
+            games = games,
+            selectedGame = selectedGame,
+            onGameSelected = onGameSelected
+        )
+    }
+}
+
+@Composable
+private fun NxiReportsWorkspace(
+    lastReport: GameSessionReport?,
+    history: List<GameSessionReport>,
+    exportStatus: String?,
+    onExportTxt: () -> Unit,
+    onExportJson: () -> Unit
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        if (lastReport != null) {
+            NxiReportCard(
+                report = lastReport,
+                exportStatus = exportStatus,
+                onExportTxt = onExportTxt,
+                onExportJson = onExportJson
+            )
+        } else {
+            NxiWorkspaceNotice(
+                title = "NO REPORT",
+                text = "Run a session first. Reports, history and export will appear here."
+            )
+        }
+
+        NxiHistoryCard(history = history)
+    }
+}
+
+@Composable
+private fun NxiRootWorkspace(
+    rootState: RootDiagnosticsState,
+    onCheckRoot: () -> Unit,
+    onDisableRoot: () -> Unit
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        NxiWorkspaceNotice(
+            title = "ROOT CONTROL",
+            text = "Root metrics are disabled by default. Check Root explicitly before collecting CPU snapshots."
+        )
+
+        NxiRootDiagnosticsCard(
+            state = rootState,
+            onCheckRoot = onCheckRoot,
+            onDisableRoot = onDisableRoot
+        )
+    }
+}
+
+@Composable
+private fun NxiWorkspaceNotice(
+    title: String,
+    text: String
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(16.dp)
+    ) {
+        Text(
+            text = title,
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = text,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall
+        )
     }
 }
 
