@@ -1,13 +1,17 @@
 package com.lolokeksu.gamepulse
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -58,6 +62,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lolokeksu.gamepulse.ui.theme.NxiTheme
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
@@ -78,6 +87,10 @@ data class GameSessionReport(
     val startBatteryPercent: Int?,
     val endBatteryPercent: Int?,
     val refreshRateHz: Float?,
+    val startRootAvailable: Boolean?,
+    val endRootAvailable: Boolean?,
+    val startCpuSnapshot: String?,
+    val endCpuSnapshot: String?,
     val completedAtMs: Long
 ) {
     val batteryDrainPercent: Int?
@@ -118,6 +131,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
     var reportHistory by remember { mutableStateOf<List<GameSessionReport>>(emptyList()) }
     var manualPackageInput by remember { mutableStateOf("") }
     var manualStatus by remember { mutableStateOf<String?>(null) }
+    var exportStatus by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         games = loadLaunchableGames(context, packageManager)
@@ -130,6 +144,7 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
         finishActiveSessionIfNeeded(context)?.let { report ->
             lastReport = report
             reportHistory = loadReportHistory(context)
+            exportStatus = null
         }
     }
 
@@ -165,9 +180,9 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
 
                 NxiMetricCard(
                     modifier = Modifier.weight(1f),
-                    title = "DRAIN",
-                    value = lastReport?.batteryDrainPercent?.let { "$it%" } ?: "--",
-                    caption = "last session"
+                    title = "COST",
+                    value = lastReport?.let { formatBatteryCost(it) } ?: "--",
+                    caption = "battery/min"
                 )
             }
 
@@ -203,7 +218,24 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
             )
 
             lastReport?.let { report ->
-                NxiReportCard(report = report)
+                NxiReportCard(
+                    report = report,
+                    exportStatus = exportStatus,
+                    onExportTxt = {
+                        exportStatus = exportReport(
+                            context = context,
+                            report = report,
+                            format = ExportFormat.TXT
+                        )
+                    },
+                    onExportJson = {
+                        exportStatus = exportReport(
+                            context = context,
+                            report = report,
+                            format = ExportFormat.JSON
+                        )
+                    }
+                )
             }
 
             NxiHistoryCard(history = reportHistory)
@@ -222,6 +254,11 @@ private fun GamePulseApp(refreshTick: MutableState<Long>) {
             Spacer(modifier = Modifier.height(8.dp))
         }
     }
+}
+
+private enum class ExportFormat {
+    TXT,
+    JSON
 }
 
 private fun addManualGame(
@@ -298,6 +335,13 @@ private fun startGameSession(context: Context, game: GameApp) {
     val packageManager = context.packageManager
     val launchIntent = packageManager.getLaunchIntentForPackage(game.packageName) ?: return
 
+    val rootAvailable = isRootAvailable()
+    val cpuSnapshot = if (rootAvailable) {
+        readCpuFreqSnapshotWithRoot()
+    } else {
+        null
+    }
+
     val prefs = context.getSharedPreferences("gamepulse_sessions", Context.MODE_PRIVATE)
 
     prefs.edit()
@@ -308,6 +352,8 @@ private fun startGameSession(context: Context, game: GameApp) {
         .putFloat("start_battery_temp_c", readBatteryTemperatureC(context) ?: -1f)
         .putInt("start_battery_percent", readBatteryPercent(context) ?: -1)
         .putFloat("refresh_rate_hz", readRefreshRateHz(context) ?: -1f)
+        .putBoolean("start_root_available", rootAvailable)
+        .putString("start_cpu_snapshot", cpuSnapshot)
         .apply()
 
     launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -334,6 +380,13 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         return null
     }
 
+    val endRootAvailable = isRootAvailable()
+    val endCpuSnapshot = if (endRootAvailable) {
+        readCpuFreqSnapshotWithRoot()
+    } else {
+        null
+    }
+
     val report = GameSessionReport(
         gameLabel = prefs.getString("game_label", "Unknown game") ?: "Unknown game",
         packageName = prefs.getString("package_name", "unknown.package") ?: "unknown.package",
@@ -343,6 +396,10 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         startBatteryPercent = prefs.getInt("start_battery_percent", -1).takeIf { it >= 0 },
         endBatteryPercent = readBatteryPercent(context),
         refreshRateHz = prefs.getFloat("refresh_rate_hz", -1f).takeIf { it >= 0f },
+        startRootAvailable = prefs.getBoolean("start_root_available", false),
+        endRootAvailable = endRootAvailable,
+        startCpuSnapshot = prefs.getString("start_cpu_snapshot", null),
+        endCpuSnapshot = endCpuSnapshot,
         completedAtMs = System.currentTimeMillis()
     )
 
@@ -356,6 +413,10 @@ private fun finishActiveSessionIfNeeded(context: Context): GameSessionReport? {
         .putInt("last_start_battery_percent", report.startBatteryPercent ?: -1)
         .putInt("last_end_battery_percent", report.endBatteryPercent ?: -1)
         .putFloat("last_refresh_rate_hz", report.refreshRateHz ?: -1f)
+        .putBoolean("last_start_root_available", report.startRootAvailable ?: false)
+        .putBoolean("last_end_root_available", report.endRootAvailable ?: false)
+        .putString("last_start_cpu_snapshot", report.startCpuSnapshot)
+        .putString("last_end_cpu_snapshot", report.endCpuSnapshot)
         .putLong("last_completed_at_ms", report.completedAtMs)
         .apply()
 
@@ -381,6 +442,10 @@ private fun loadLastReport(context: Context): GameSessionReport? {
         startBatteryPercent = prefs.getInt("last_start_battery_percent", -1).takeIf { it >= 0 },
         endBatteryPercent = prefs.getInt("last_end_battery_percent", -1).takeIf { it >= 0 },
         refreshRateHz = prefs.getFloat("last_refresh_rate_hz", -1f).takeIf { it >= 0f },
+        startRootAvailable = prefs.getBoolean("last_start_root_available", false),
+        endRootAvailable = prefs.getBoolean("last_end_root_available", false),
+        startCpuSnapshot = prefs.getString("last_start_cpu_snapshot", null),
+        endCpuSnapshot = prefs.getString("last_end_cpu_snapshot", null),
         completedAtMs = prefs.getLong("last_completed_at_ms", 0L)
     )
 }
@@ -412,6 +477,10 @@ private fun appendReportHistory(
                 .put("startBatteryPercent", item.startBatteryPercent ?: JSONObject.NULL)
                 .put("endBatteryPercent", item.endBatteryPercent ?: JSONObject.NULL)
                 .put("refreshRateHz", item.refreshRateHz ?: JSONObject.NULL)
+                .put("startRootAvailable", item.startRootAvailable ?: JSONObject.NULL)
+                .put("endRootAvailable", item.endRootAvailable ?: JSONObject.NULL)
+                .put("startCpuSnapshot", item.startCpuSnapshot ?: JSONObject.NULL)
+                .put("endCpuSnapshot", item.endCpuSnapshot ?: JSONObject.NULL)
                 .put("completedAtMs", item.completedAtMs)
 
             array.put(objectValue)
@@ -450,6 +519,10 @@ private fun loadReportHistory(context: Context): List<GameSessionReport> {
                         startBatteryPercent = item.optNullableInt("startBatteryPercent"),
                         endBatteryPercent = item.optNullableInt("endBatteryPercent"),
                         refreshRateHz = item.optNullableFloat("refreshRateHz"),
+                        startRootAvailable = item.optNullableBoolean("startRootAvailable"),
+                        endRootAvailable = item.optNullableBoolean("endRootAvailable"),
+                        startCpuSnapshot = item.optNullableString("startCpuSnapshot"),
+                        endCpuSnapshot = item.optNullableString("endCpuSnapshot"),
                         completedAtMs = completedAtMs
                     )
                 )
@@ -486,6 +559,22 @@ private fun JSONObject.optNullableInt(name: String): Int? {
     } else {
         value
     }
+}
+
+private fun JSONObject.optNullableBoolean(name: String): Boolean? {
+    if (!has(name) || isNull(name)) {
+        return null
+    }
+
+    return optBoolean(name)
+}
+
+private fun JSONObject.optNullableString(name: String): String? {
+    if (!has(name) || isNull(name)) {
+        return null
+    }
+
+    return optString(name).takeIf { it.isNotBlank() }
 }
 
 private fun readBatteryTemperatureC(context: Context): Float? {
@@ -562,6 +651,270 @@ private fun loadLaunchableGames(
         )
 }
 
+private fun isRootAvailable(): Boolean {
+    val output = runRootCommand("echo gamepulse_root_ok", 1_500L)
+    return output?.contains("gamepulse_root_ok") == true
+}
+
+private fun readCpuFreqSnapshotWithRoot(): String? {
+    val command = """
+        for p in /sys/devices/system/cpu/cpufreq/policy*; do
+          [ -d "${'$'}p" ] || continue
+          name=${'$'}(basename "${'$'}p")
+          cur=${'$'}(cat "${'$'}p/scaling_cur_freq" 2>/dev/null || echo -)
+          min=${'$'}(cat "${'$'}p/scaling_min_freq" 2>/dev/null || echo -)
+          max=${'$'}(cat "${'$'}p/scaling_max_freq" 2>/dev/null || echo -)
+          echo "${'$'}name cur=${'$'}cur min=${'$'}min max=${'$'}max"
+        done
+    """.trimIndent()
+
+    return runRootCommand(command, 2_000L)
+        ?.lines()
+        ?.map { it.trim() }
+        ?.filter { it.isNotBlank() }
+        ?.joinToString("\n")
+        ?.takeIf { it.isNotBlank() }
+}
+
+private fun runRootCommand(
+    command: String,
+    timeoutMs: Long
+): String? {
+    return try {
+        val process = ProcessBuilder("su", "-c", command)
+            .redirectErrorStream(true)
+            .start()
+
+        val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+
+        if (!finished) {
+            process.destroyForcibly()
+            return null
+        }
+
+        process.inputStream.bufferedReader().use { it.readText() }.trim()
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun batteryCostPercentPerMinute(report: GameSessionReport): Float? {
+    val drain = report.batteryDrainPercent ?: return null
+    val minutes = report.durationMs / 60_000f
+
+    if (minutes <= 0f) {
+        return null
+    }
+
+    return drain / minutes
+}
+
+private fun estimatedFullBatteryMinutes(report: GameSessionReport): Int? {
+    val rate = batteryCostPercentPerMinute(report) ?: return null
+
+    if (rate <= 0f) {
+        return null
+    }
+
+    return (100f / rate).roundToInt().coerceAtLeast(1)
+}
+
+private fun thermalVerdict(report: GameSessionReport): String {
+    val start = report.startBatteryTempC
+    val end = report.endBatteryTempC
+
+    if (end == null) {
+        return "UNKNOWN"
+    }
+
+    val delta = if (start != null) end - start else 0f
+
+    return when {
+        end >= 45f || delta >= 6f -> "HOT"
+        end >= 42f || delta >= 4f -> "HIGH"
+        end >= 39f || delta >= 2f -> "MODERATE"
+        else -> "NORMAL"
+    }
+}
+
+private fun refreshVerdict(report: GameSessionReport): String {
+    val hz = report.refreshRateHz ?: return "UNKNOWN"
+
+    return when {
+        hz >= 120f -> "HIGH"
+        hz >= 90f -> "GOOD"
+        hz >= 60f -> "STANDARD"
+        else -> "LOW"
+    }
+}
+
+private fun batteryCostVerdict(report: GameSessionReport): String {
+    val rate = batteryCostPercentPerMinute(report) ?: return "UNKNOWN"
+
+    return when {
+        rate >= 2f -> "HIGH"
+        rate >= 1f -> "MODERATE"
+        rate > 0f -> "NORMAL"
+        else -> "LOW"
+    }
+}
+
+private fun buildSessionVerdict(report: GameSessionReport): String {
+    val issues = mutableListOf<String>()
+
+    when (thermalVerdict(report)) {
+        "HOT" -> issues.add("very high temperature")
+        "HIGH" -> issues.add("thermal pressure")
+        "MODERATE" -> issues.add("moderate heating")
+    }
+
+    when (batteryCostVerdict(report)) {
+        "HIGH" -> issues.add("high battery cost")
+        "MODERATE" -> issues.add("moderate battery cost")
+    }
+
+    if (refreshVerdict(report) == "LOW") {
+        issues.add("low refresh rate")
+    }
+
+    if (report.endRootAvailable == false) {
+        issues.add("root metrics unavailable")
+    }
+
+    return if (issues.isEmpty()) {
+        "Stable basic session. No strong thermal, battery, or refresh issue detected in this MVP report."
+    } else {
+        "Detected: ${issues.joinToString(", ")}. Check temperature, battery cost, refresh rate and root CPU snapshot."
+    }
+}
+
+private fun exportReport(
+    context: Context,
+    report: GameSessionReport,
+    format: ExportFormat
+): String {
+    return try {
+        val timestamp = reportFileTimestamp(report.completedAtMs)
+        val safeGame = sanitizeFileName(report.gameLabel)
+        val extension = if (format == ExportFormat.TXT) "txt" else "json"
+        val mimeType = if (format == ExportFormat.TXT) "text/plain" else "application/json"
+        val fileName = "GamePulse_${safeGame}_${timestamp}.${extension}"
+        val content = if (format == ExportFormat.TXT) {
+            buildTextReport(report)
+        } else {
+            buildJsonReport(report).toString(2)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/GamePulseAnalyzer")
+            }
+
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: return "Export failed: MediaStore insert returned null."
+
+            resolver.openOutputStream(uri)?.use { output ->
+                output.write(content.toByteArray(Charsets.UTF_8))
+            } ?: return "Export failed: output stream is null."
+
+            "Exported: Download/GamePulseAnalyzer/$fileName"
+        } else {
+            val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "GamePulseAnalyzer")
+            dir.mkdirs()
+
+            val file = File(dir, fileName)
+            file.writeText(content)
+
+            "Exported: ${file.absolutePath}"
+        }
+    } catch (error: Exception) {
+        "Export failed: ${error.message ?: "unknown error"}"
+    }
+}
+
+private fun buildTextReport(report: GameSessionReport): String {
+    return buildString {
+        appendLine("GamePulse Analyzer Report")
+        appendLine()
+        appendLine("Game: ${report.gameLabel}")
+        appendLine("Package: ${report.packageName}")
+        appendLine("Duration: ${formatDurationLong(report.durationMs)}")
+        appendLine()
+        appendLine("Thermal:")
+        appendLine("- Start temp: ${formatTemp(report.startBatteryTempC)}")
+        appendLine("- End temp: ${formatTemp(report.endBatteryTempC)}")
+        appendLine("- Verdict: ${thermalVerdict(report)}")
+        appendLine()
+        appendLine("Battery:")
+        appendLine("- Start battery: ${formatBatteryPercent(report.startBatteryPercent)}")
+        appendLine("- End battery: ${formatBatteryPercent(report.endBatteryPercent)}")
+        appendLine("- Drain: ${formatBatteryDrain(report.batteryDrainPercent)}")
+        appendLine("- Cost: ${formatBatteryCost(report)}")
+        appendLine("- Estimated full battery session: ${formatEstimatedFullBattery(report)}")
+        appendLine("- Verdict: ${batteryCostVerdict(report)}")
+        appendLine()
+        appendLine("Display:")
+        appendLine("- Refresh rate: ${formatHz(report.refreshRateHz)}")
+        appendLine("- Verdict: ${refreshVerdict(report)}")
+        appendLine()
+        appendLine("Root:")
+        appendLine("- Start root: ${formatRootState(report.startRootAvailable)}")
+        appendLine("- End root: ${formatRootState(report.endRootAvailable)}")
+        appendLine()
+        appendLine("Start CPU snapshot:")
+        appendLine(report.startCpuSnapshot ?: "--")
+        appendLine()
+        appendLine("End CPU snapshot:")
+        appendLine(report.endCpuSnapshot ?: "--")
+        appendLine()
+        appendLine("Session verdict:")
+        appendLine(buildSessionVerdict(report))
+    }
+}
+
+private fun buildJsonReport(report: GameSessionReport): JSONObject {
+    return JSONObject()
+        .put("app", "GamePulse Analyzer")
+        .put("gameLabel", report.gameLabel)
+        .put("packageName", report.packageName)
+        .put("durationMs", report.durationMs)
+        .put("durationFormatted", formatDurationLong(report.durationMs))
+        .put("startBatteryTempC", report.startBatteryTempC ?: JSONObject.NULL)
+        .put("endBatteryTempC", report.endBatteryTempC ?: JSONObject.NULL)
+        .put("thermalVerdict", thermalVerdict(report))
+        .put("startBatteryPercent", report.startBatteryPercent ?: JSONObject.NULL)
+        .put("endBatteryPercent", report.endBatteryPercent ?: JSONObject.NULL)
+        .put("batteryDrainPercent", report.batteryDrainPercent ?: JSONObject.NULL)
+        .put("batteryCostPercentPerMinute", batteryCostPercentPerMinute(report) ?: JSONObject.NULL)
+        .put("estimatedFullBatteryMinutes", estimatedFullBatteryMinutes(report) ?: JSONObject.NULL)
+        .put("batteryCostVerdict", batteryCostVerdict(report))
+        .put("refreshRateHz", report.refreshRateHz ?: JSONObject.NULL)
+        .put("refreshVerdict", refreshVerdict(report))
+        .put("startRootAvailable", report.startRootAvailable ?: JSONObject.NULL)
+        .put("endRootAvailable", report.endRootAvailable ?: JSONObject.NULL)
+        .put("startCpuSnapshot", report.startCpuSnapshot ?: JSONObject.NULL)
+        .put("endCpuSnapshot", report.endCpuSnapshot ?: JSONObject.NULL)
+        .put("sessionVerdict", buildSessionVerdict(report))
+        .put("completedAtMs", report.completedAtMs)
+}
+
+private fun sanitizeFileName(value: String): String {
+    return value
+        .trim()
+        .ifBlank { "unknown_game" }
+        .replace(Regex("[^A-Za-z0-9._-]+"), "_")
+        .trim('_')
+        .ifBlank { "unknown_game" }
+}
+
+private fun reportFileTimestamp(timeMs: Long): String {
+    val formatter = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+    return formatter.format(Date(timeMs))
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun NxiHeader() {
@@ -611,10 +964,11 @@ private fun NxiHeader() {
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            NxiChip("GAME SCAN")
-            NxiChip("SESSION")
+            NxiChip("THERMAL")
             NxiChip("BATTERY")
-            NxiChip("REPORT")
+            NxiChip("REFRESH")
+            NxiChip("ROOT")
+            NxiChip("EXPORT")
         }
     }
 }
@@ -696,7 +1050,7 @@ private fun NxiSessionCard(
             Spacer(modifier = Modifier.height(10.dp))
 
             Text(
-                text = "Last report: ${formatDurationShort(lastReport.durationMs)} / drain ${formatBatteryDrain(lastReport.batteryDrainPercent)}",
+                text = "Last report: ${formatDurationShort(lastReport.durationMs)} / ${thermalVerdict(lastReport)} / ${formatBatteryCost(lastReport)}",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace
@@ -944,7 +1298,12 @@ private fun NxiGameRow(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun NxiReportCard(report: GameSessionReport) {
+private fun NxiReportCard(
+    report: GameSessionReport,
+    exportStatus: String?,
+    onExportTxt: () -> Unit,
+    onExportJson: () -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -985,13 +1344,119 @@ private fun NxiReportCard(report: GameSessionReport) {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             NxiReportPill("DURATION", formatDurationLong(report.durationMs))
+            NxiReportPill("THERMAL", thermalVerdict(report))
             NxiReportPill("START TEMP", formatTemp(report.startBatteryTempC))
             NxiReportPill("END TEMP", formatTemp(report.endBatteryTempC))
-            NxiReportPill("START BAT", formatBatteryPercent(report.startBatteryPercent))
-            NxiReportPill("END BAT", formatBatteryPercent(report.endBatteryPercent))
             NxiReportPill("DRAIN", formatBatteryDrain(report.batteryDrainPercent))
-            NxiReportPill("REFRESH", formatHz(report.refreshRateHz))
+            NxiReportPill("COST", formatBatteryCost(report))
+            NxiReportPill("ESTIMATE", formatEstimatedFullBattery(report))
+            NxiReportPill("REFRESH", "${formatHz(report.refreshRateHz)} / ${refreshVerdict(report)}")
+            NxiReportPill("ROOT", formatRootState(report.endRootAvailable))
         }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        NxiVerdictBlock(text = buildSessionVerdict(report))
+
+        val cpuSnapshot = report.endCpuSnapshot ?: report.startCpuSnapshot
+
+        if (!cpuSnapshot.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            NxiCodeBlock(
+                title = "CPU SNAPSHOT",
+                value = cpuSnapshot
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            NxiPrimaryButton(
+                text = "Export TXT",
+                modifier = Modifier.weight(1f),
+                enabled = true,
+                onClick = onExportTxt
+            )
+
+            NxiPrimaryButton(
+                text = "Export JSON",
+                modifier = Modifier.weight(1f),
+                enabled = true,
+                onClick = onExportJson
+            )
+        }
+
+        if (exportStatus != null) {
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Text(
+                text = exportStatus,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+}
+
+@Composable
+private fun NxiVerdictBlock(text: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.background)
+            .padding(12.dp)
+    ) {
+        Text(
+            text = "VERDICT",
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Text(
+            text = text,
+            color = MaterialTheme.colorScheme.onBackground,
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
+
+@Composable
+private fun NxiCodeBlock(
+    title: String,
+    value: String
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.background)
+            .padding(12.dp)
+    ) {
+        Text(
+            text = title,
+            color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Text(
+            text = value,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace
+        )
     }
 }
 
@@ -1090,7 +1555,7 @@ private fun NxiHistoryRow(report: GameSessionReport) {
         Spacer(modifier = Modifier.height(4.dp))
 
         Text(
-            text = "${formatTemp(report.startBatteryTempC)} → ${formatTemp(report.endBatteryTempC)}  /  ${formatBatteryPercent(report.startBatteryPercent)} → ${formatBatteryPercent(report.endBatteryPercent)}  /  drain ${formatBatteryDrain(report.batteryDrainPercent)}",
+            text = "${thermalVerdict(report)} / ${formatBatteryCost(report)} / ${formatHz(report.refreshRateHz)}",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace
@@ -1212,4 +1677,43 @@ private fun formatBatteryPercent(value: Int?): String {
 
 private fun formatBatteryDrain(value: Int?): String {
     return value?.let { "$it%" } ?: "--"
+}
+
+private fun formatBatteryCost(report: GameSessionReport): String {
+    val rate = batteryCostPercentPerMinute(report) ?: return "--"
+
+    return if (rate <= 0f) {
+        "0%/min"
+    } else {
+        "${formatRate(rate)}%/min"
+    }
+}
+
+private fun formatEstimatedFullBattery(report: GameSessionReport): String {
+    val minutes = estimatedFullBatteryMinutes(report) ?: return "--"
+
+    val hours = minutes / 60
+    val leftMinutes = minutes % 60
+
+    return if (hours > 0) {
+        "${hours}h ${leftMinutes}m"
+    } else {
+        "${leftMinutes}m"
+    }
+}
+
+private fun formatRate(value: Float): String {
+    return if (value >= 10f) {
+        String.format(Locale.US, "%.1f", value)
+    } else {
+        String.format(Locale.US, "%.2f", value)
+    }
+}
+
+private fun formatRootState(value: Boolean?): String {
+    return when (value) {
+        true -> "available"
+        false -> "blocked"
+        null -> "--"
+    }
 }
