@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace = "com.lolokeksu.gamepulse"
-    compileSdk = 36
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "com.lolokeksu.gamepulse"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
     }
@@ -30,10 +30,15 @@ android {
     buildFeatures {
         compose = true
     }
-}
 
-kotlin {
-    jvmToolchain(17)
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 }
 
 dependencies {
